@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pylittle"
+version = "0.0.1"
+description = "Python-first, hardware-aware LLM inference for low-VRAM devices"
+authors = [{ name = "PyLittle" }]
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+]
+
+[project.urls]
+Homepage = "https://example.com/pylittle"
+
+[project.scripts]
+pylittle = "pylittle.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "."}
+packages = ["pylittle", "pylittle.adapters", "pylittle.utils"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+"pylittle" = ["py.typed"]

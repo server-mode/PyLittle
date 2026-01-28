@@ -1,0 +1,1 @@
+python -m uvicorn tools.webdash.server:app --host 127.0.0.1 --port 7860

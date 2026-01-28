@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PyLittle Bench Dashboard</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header>
+    <h1>PyLittle Bench Dashboard</h1>
+    <div id="gpu-summary"></div>
+  </header>
+
+  <section class="controls">
+    <div class="row">
+      <label>Preset</label>
+      <select id="preset">
+        <option value="tiny">tiny</option>
+        <option value="350m">350m</option>
+        <option value="410m">410m</option>
+        <option value="1b">1b</option>
+      </select>
+      <label>Device</label>
+      <select id="device">
+        <option value="auto">auto</option>
+        <option value="cuda">cuda</option>
+        <option value="cpu">cpu</option>
+      </select>
+      <label>Strategy</label>
+      <select id="strategy">
+        <option value="low_vram_auto">low_vram_auto</option>
+  <option value="gpu_only">gpu_only</option>
+        <option value="">(none)</option>
+      </select>
+      <label>Tokens</label>
+      <input id="tokens" type="number" value="64" />
+      <label>Paging window</label>
+      <input id="paging" type="number" placeholder="(optional)" />
+      <label>Stream</label>
+      <input id="stream" type="checkbox" checked />
+      <button id="run">Chạy benchmark</button>
+    </div>
+  </section>
+
+  <section class="panels">
+    <div class="panel">
+      <h3>GPU realtime</h3>
+      <canvas id="chart-gpu"></canvas>
+      <div class="grid" id="gpu-table"></div>
+    </div>
+    <div class="panel">
+  <h3>Kết quả</h3>
+  <div id="summary-table" class="summary"></div>
+      <pre id="output" class="logs"></pre>
+    </div>
+  </section>
+
+  <footer>
+    <small>PyLittle • Dashboard test GPU/VRAM/Throughput • WebSocket</small>
+  </footer>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="/static/main.js"></script>
+</body>
+</html>
