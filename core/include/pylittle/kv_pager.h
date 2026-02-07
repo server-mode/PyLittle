@@ -25,6 +25,10 @@ public:
     // Append KV bytes for a sequence
     void append_kv(int seq_id, const void* data, size_t bytes);
 
+    // Append KV bookkeeping without storing data.
+    // tokens is the number of tokens represented by the appended bytes.
+    void append_kv_bytes(int seq_id, size_t bytes, size_t tokens);
+
     // Request a sliding window of recent tokens
     // Returns number of bytes currently pinned in GPU for the window
     size_t request_window(int seq_id, size_t recent_tokens);
@@ -36,9 +40,9 @@ public:
 
 private:
     struct Page {
-        std::vector<char> host; // backing storage
+        size_t host_bytes = 0; // backing storage size (bookkeeping)
         bool on_gpu = false;
-        size_t tokens = 0; // tokens represented by this page (approx)
+        size_t tokens = 0; // tokens represented by this page
     };
 
     MemoryManager* mm_;

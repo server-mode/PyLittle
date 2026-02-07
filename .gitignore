@@ -44,3 +44,6 @@ Thumbs.db
 # Database
 *.db
 *.sqlite3
+
+# Project docs (local)
+ROADMAP.md

@@ -1,12 +1,20 @@
-"""
-Hugging Face runtime adapter for PyLittle.
-- Uses transformers to run a small LLM while letting PyLittle handle streaming + policy hooks.
-- This is a temporary bridge until native backends are fully implemented.
-"""
-from __future__ import annotations
-from typing import Iterator, Optional, Dict, Any
+"""Hugging Face runtime adapter for PyLittle.
 
-try:  # optional native pager
+This is a bridge layer for running Transformers models while we build native backends.
+
+Key paths:
+- Default: `model.generate(...)` (+ streamer)
+- KV-window: token-by-token loop with `past_key_values` truncation (single-device only)
+- Synthetic: fully-offline tiny GPT-2-like model for smoke testing without HF downloads
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, Iterator, Optional
+import time
+
+
+try:  # optional native async copy
     from pylittle._pylittle import MemoryManager as _NativeMM, KVPager as _NativePager  # type: ignore
 except Exception:  # pragma: no cover
     _NativeMM = None
@@ -16,12 +24,665 @@ except Exception:  # pragma: no cover
 def _pick_device(engine_device: str | None = None) -> str:
     try:
         import torch
+
         if torch.cuda.is_available():
             return "cuda"
-        # TODO: rocm check if needed
     except Exception:
         pass
     return "cpu"
+
+
+def _sample_next_token(logits, temperature: float):
+    import torch
+
+    if temperature is None or temperature <= 0:
+        return torch.argmax(logits, dim=-1)
+    probs = torch.softmax(logits / float(temperature), dim=-1)
+    return torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+
+def _estimate_kv_bytes_per_token(model) -> int:
+    """Rough estimate of KV bytes per generated token for batch=1.
+
+    Used only for simulated PCIe throttling.
+    """
+    try:
+        import torch
+
+        cfg = getattr(model, "config", None)
+        n_layer = int(getattr(cfg, "num_hidden_layers", getattr(cfg, "n_layer", 0)) or 0)
+        hidden = int(getattr(cfg, "hidden_size", getattr(cfg, "n_embd", 0)) or 0)
+        if n_layer <= 0 or hidden <= 0:
+            return 0
+        dt = getattr(model, "dtype", torch.float16)
+        dtype_bytes = int(getattr(dt, "itemsize", 2) or 2)
+        # K and V per layer per token ~ hidden_size each.
+        return int(2 * n_layer * hidden * dtype_bytes)
+    except Exception:
+        return 0
+
+
+def _maybe_simulate_pcie(strategy: Optional[Dict[str, Any]], n_tokens: int, kv_bytes_per_token: int) -> None:
+    if not strategy or not isinstance(strategy, dict):
+        return
+    gbps = strategy.get("sim_pcie_gbps")
+    if gbps is None:
+        return
+    try:
+        gbps_f = float(gbps)
+    except Exception:
+        return
+    if gbps_f <= 0:
+        return
+    overhead_us = strategy.get("sim_pcie_overhead_us", 50.0)
+    try:
+        overhead_us_f = float(overhead_us)
+    except Exception:
+        overhead_us_f = 50.0
+    # Approximate: per token, transfer its KV footprint once.
+    bytes_total = int(max(0, n_tokens)) * int(max(0, kv_bytes_per_token))
+    if bytes_total <= 0:
+        # Still apply fixed per-token overhead to represent latency.
+        bytes_total = 0
+    # seconds = bytes / (GB/s) + overhead
+    seconds = (float(bytes_total) / (gbps_f * 1e9)) + (overhead_us_f * 1e-6 * float(max(1, n_tokens)))
+    if seconds > 0:
+        time.sleep(seconds)
+
+
+class _StreamWithMetrics(Iterator[str]):
+    def __init__(self, it: Iterator[str]):
+        self._it = it
+        self.tokens_generated: int = 0
+        self.time_to_first_token_s: Optional[float] = None
+        self._t0 = time.perf_counter()
+        self.kv_pager_state: Optional[dict] = None
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> str:
+        v = next(self._it)
+        if self.tokens_generated == 0 and self.time_to_first_token_s is None:
+            self.time_to_first_token_s = time.perf_counter() - self._t0
+        # For manual decode we treat each yielded chunk as >=1 token.
+        self.tokens_generated += 1
+        return v
+
+
+def _get_strategy_kw(strategy: Optional[Dict[str, Any]], key: str, default: Any = None) -> Any:
+    if not strategy or not isinstance(strategy, dict):
+        return default
+    return strategy.get(key, default)
+
+
+def _maybe_to_cache(past):
+    if past is None:
+        return None
+    try:
+        from transformers.cache_utils import DynamicCache  # type: ignore
+
+        if isinstance(past, DynamicCache):
+            return past
+        # legacy tuple/list -> DynamicCache
+        return DynamicCache.from_legacy_cache(past)
+    except Exception:
+        return past
+
+
+def _cache_seq_len(past, head_candidates: tuple[int, ...] | None) -> int:
+    if past is None:
+        return 0
+    # Cache API
+    try:
+        if hasattr(past, "get_seq_length"):
+            v = past.get_seq_length()
+            if isinstance(v, int):
+                return v
+    except Exception:
+        pass
+    # Legacy tuple
+    try:
+        if isinstance(past, (tuple, list)) and len(past) > 0:
+            pk = past[0][0]
+            if getattr(pk, "dim", lambda: 0)() == 4:
+                seq_dim = _infer_seq_dim_from_heads(pk, head_candidates)
+                return int(pk.shape[seq_dim])
+    except Exception:
+        pass
+    return 0
+
+
+def _maybe_crop_cache(past, window: int):
+    if past is None or window is None or window <= 0:
+        return past
+    # Cache API
+    try:
+        if hasattr(past, "crop"):
+            out = past.crop(window)
+            return out if out is not None else past
+    except Exception:
+        pass
+    return past
+
+
+def _input_device_for_model(model, fallback: str) -> str:
+    # Best-effort: figure out where inputs should live when using device_map.
+    try:
+        emb = getattr(model, "get_input_embeddings", None)
+        if callable(emb):
+            w = emb().weight
+            d = getattr(w, "device", None)
+            if d is not None and str(d) != "meta":
+                return str(d)
+    except Exception:
+        pass
+    try:
+        for p in model.parameters():
+            d = getattr(p, "device", None)
+            if d is not None and str(d) != "meta":
+                return str(d)
+            break
+    except Exception:
+        pass
+    return fallback
+
+
+def _summarize_hf_device_map(model) -> Dict[str, int] | None:
+    try:
+        dm = getattr(model, "hf_device_map", None)
+        if not isinstance(dm, dict):
+            return None
+        out: Dict[str, int] = {}
+        for _, v in dm.items():
+            k = str(v)
+            out[k] = out.get(k, 0) + 1
+        return out
+    except Exception:
+        return None
+
+
+def _quant_sanity(model, quant_requested: str | None) -> Dict[str, Any]:
+    info: Dict[str, Any] = {
+        "quant_requested": quant_requested,
+        "bnb_available": None,
+        "quant_active": False,
+        "details": {},
+    }
+    if not quant_requested:
+        return info
+
+    bnb_ok = False
+    try:
+        import bitsandbytes as bnb  # noqa: F401
+
+        bnb_ok = True
+    except Exception:
+        bnb_ok = False
+    info["bnb_available"] = bnb_ok
+
+    # Fast-path flags used by Transformers
+    try:
+        info["details"]["is_loaded_in_4bit"] = bool(getattr(model, "is_loaded_in_4bit", False))
+        info["details"]["is_loaded_in_8bit"] = bool(getattr(model, "is_loaded_in_8bit", False))
+    except Exception:
+        pass
+
+    active = bool(info["details"].get("is_loaded_in_4bit")) or bool(info["details"].get("is_loaded_in_8bit"))
+
+    # Module scan as fallback
+    if not active and bnb_ok:
+        try:
+            from bitsandbytes.nn import Linear4bit, Linear8bitLt  # type: ignore
+
+            has_4 = False
+            has_8 = False
+            for m in model.modules():
+                if isinstance(m, Linear4bit):
+                    has_4 = True
+                if isinstance(m, Linear8bitLt):
+                    has_8 = True
+                if has_4 and has_8:
+                    break
+            info["details"]["has_bnb_linear4bit"] = has_4
+            info["details"]["has_bnb_linear8bit"] = has_8
+            active = has_4 or has_8
+        except Exception:
+            pass
+
+    info["quant_active"] = active
+    return info
+
+
+def hf_load_model(
+    model_name_or_path: str,
+    *,
+    device: str = "auto",
+    strategy: Optional[Dict[str, Any]] = None,
+    engine_device_hint: str | None = None,
+):
+    """Load HF model+tokenizer with a low-VRAM plan and return a sanity report.
+
+    Returns: (model, tokenizer, report)
+    """
+    import torch
+    import sys
+
+    def _jsonable(x: Any):
+        # Best-effort conversion for reporting only.
+        if x is None or isinstance(x, (bool, int, float, str)):
+            return x
+        try:
+            if isinstance(x, (list, tuple)):
+                return [_jsonable(v) for v in x]
+            if isinstance(x, dict):
+                return {str(k): _jsonable(v) for k, v in x.items()}
+        except Exception:
+            pass
+        # torch.dtype and many HF objects are not JSON serializable.
+        try:
+            import torch as _torch
+
+            if isinstance(x, getattr(_torch, "dtype", ())):
+                return str(x)
+        except Exception:
+            pass
+        return str(x)
+
+    # Device normalization (match hf_generate semantics)
+    if strategy and isinstance(strategy, dict) and strategy.get("device") in ("cpu", "cuda"):
+        dev = str(strategy.get("device"))
+    elif device is None or str(device).lower() == "auto":
+        dev = _pick_device(engine_device_hint)
+    else:
+        dev = str(device).lower()
+
+    try:
+        if dev == "cuda" and not torch.cuda.is_available():
+            dev = "cpu"
+    except Exception:
+        dev = "cpu"
+
+    is_synthetic = str(model_name_or_path).lower() in ("synthetic-gpt2", "synthetic")
+    used_device_map = False
+    report: Dict[str, Any] = {
+        "model": model_name_or_path,
+        "device": dev,
+        "is_synthetic": is_synthetic,
+        "used_device_map": False,
+        "device_map_summary": None,
+        "quant": None,
+        "warnings": [],
+        "load_kwargs": None,
+    }
+
+    if is_synthetic:
+        model, tokenizer = _make_synthetic_gpt2(dev)
+        report["model_class"] = "synthetic-gpt2"
+        report["is_encoder_decoder"] = False
+        report["quant"] = _quant_sanity(model, None)
+        return model, tokenizer, report
+
+    from transformers import AutoModelForCausalLM, AutoModelForSeq2SeqLM, AutoTokenizer
+
+    try:
+        local_only = bool(_get_strategy_kw(strategy, "local_files_only", False))
+        offload_req = bool(_get_strategy_kw(strategy, "offload", False))
+        quant_req = _get_strategy_kw(strategy, "quant", None)
+        print(
+            f"[INFO] pylittle.hf: hf_load_model start model={model_name_or_path} dev={dev} local_only={local_only} offload={offload_req} quant={quant_req}",
+            file=sys.stderr,
+            flush=True,
+        )
+    except Exception:
+        pass
+
+    tokenizer_kwargs: Dict[str, Any] = {}
+    for k in ("trust_remote_code", "revision", "token", "local_files_only"):
+        v = _get_strategy_kw(strategy, k, None)
+        if v is not None:
+            tokenizer_kwargs[k] = v
+    try:
+        print(f"[INFO] pylittle.hf: loading tokenizer ({tokenizer_kwargs})", file=sys.stderr, flush=True)
+    except Exception:
+        pass
+    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, **tokenizer_kwargs)
+    try:
+        print("[INFO] pylittle.hf: tokenizer loaded", file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
+    load_kwargs: Dict[str, Any] = {"use_safetensors": True, "low_cpu_mem_usage": True}
+    for k in ("trust_remote_code", "revision", "token", "local_files_only", "attn_implementation"):
+        v = _get_strategy_kw(strategy, k, None)
+        if v is not None:
+            load_kwargs[k] = v
+    td = _get_strategy_kw(strategy, "torch_dtype", None)
+    if td is not None:
+        try:
+            if isinstance(td, str):
+                td = getattr(torch, td)
+        except Exception:
+            pass
+        load_kwargs["torch_dtype"] = td
+
+    # PyLittle default perf/memory knobs (only when CUDA):
+    # - Prefer fp16 (unless using bnb quant)
+    # - Prefer FlashAttention2 if available, else SDPA
+    def _flash_attn_available() -> bool:
+        try:
+            import flash_attn  # noqa: F401
+
+            return True
+        except Exception:
+            return False
+
+    if dev == "cuda":
+        try:
+            if "attn_implementation" not in load_kwargs:
+                load_kwargs["attn_implementation"] = "flash_attention_2" if _flash_attn_available() else "sdpa"
+        except Exception:
+            pass
+
+    quant_requested = _get_strategy_kw(strategy, "quant", None)
+    # If no explicit dtype and not using bnb quant, default to fp16 on CUDA.
+    if dev == "cuda" and "torch_dtype" not in load_kwargs and quant_requested not in ("4bit", "8bit"):
+        try:
+            load_kwargs["torch_dtype"] = torch.float16
+        except Exception:
+            pass
+
+    try_fast_first = bool(_get_strategy_kw(strategy, "try_fast_cuda_first", False))
+    if quant_requested in ("4bit", "8bit"):
+        # Only enable if bnb import succeeds; sanity check later will confirm.
+        try:
+            import bitsandbytes as bnb  # noqa: F401
+
+            load_kwargs.update({
+                "load_in_4bit": quant_requested == "4bit",
+                "load_in_8bit": quant_requested == "8bit",
+            })
+        except Exception:
+            report["warnings"].append("bitsandbytes not available; quant load flags skipped")
+
+    if _get_strategy_kw(strategy, "offload", False):
+        load_kwargs["device_map"] = "auto"
+        if _get_strategy_kw(strategy, "max_memory", None):
+            raw_mm = strategy["max_memory"]
+            mm: Dict[Any, Any] = {}
+            for k, v in raw_mm.items():
+                if isinstance(k, str) and k.lower() == "cuda":
+                    mm[0] = v
+                elif isinstance(k, str) and k.isdigit():
+                    mm[int(k)] = v
+                else:
+                    mm[k] = v
+            load_kwargs["max_memory"] = mm
+        else:
+            # If user is simulating a smaller GPU, enforce max_memory accordingly.
+            sim_vram_mb = _get_strategy_kw(strategy, "sim_vram_mb", None)
+            if sim_vram_mb is not None:
+                try:
+                    sim_mb = int(sim_vram_mb)
+                    if sim_mb > 0:
+                        # Keep a safety margin for allocator fragmentation.
+                        gpu_gib = max(1, int((sim_mb / 1024.0) * 0.90))
+                        load_kwargs["max_memory"] = {0: f"{gpu_gib}GiB", "cpu": "64GiB"}
+                        report["warnings"].append(f"max_memory auto-set from sim_vram_mb={sim_mb}")
+                except Exception:
+                    pass
+        used_device_map = True
+
+    def _load_with_retry(kwargs: Dict[str, Any]):
+        model_class_local = "AutoModelForCausalLM"
+        try:
+            return AutoModelForCausalLM.from_pretrained(model_name_or_path, **kwargs), model_class_local
+        except Exception:
+            model_class_local = "AutoModelForSeq2SeqLM"
+            return AutoModelForSeq2SeqLM.from_pretrained(model_name_or_path, **kwargs), model_class_local
+
+    def _is_cuda_oom(e: Exception) -> bool:
+        s = str(e).lower()
+        return ("cuda out of memory" in s) or ("out of memory" in s and "cuda" in s)
+
+    # If offload requested, optionally try a fast single-GPU load first (fp16, no device_map)
+    # to maximize tokens/s when the model actually fits.
+    model = None
+    model_class = "AutoModelForCausalLM"
+    if dev == "cuda" and used_device_map and try_fast_first:
+        fast_kwargs = dict(load_kwargs)
+        fast_kwargs.pop("device_map", None)
+        fast_kwargs.pop("max_memory", None)
+        try:
+            report["load_kwargs"] = _jsonable(dict(fast_kwargs))
+            model, model_class = _load_with_retry(fast_kwargs)
+            try:
+                if torch.cuda.is_available():
+                    model.to("cuda")
+                    used_device_map = False
+                    report["warnings"].append("try_fast_cuda_first: loaded on single GPU (offload plan not used)")
+            except Exception as e:
+                # If move-to-cuda fails, drop to offload path.
+                if _is_cuda_oom(e):
+                    try:
+                        del model
+                    except Exception:
+                        pass
+                    model = None
+                    try:
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                else:
+                    raise
+        except Exception as e:
+            if _is_cuda_oom(e):
+                model = None
+                try:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
+            else:
+                # If failure is due to unsupported attn_implementation, retry without it.
+                s = str(e).lower()
+                if "attn_implementation" in s or "flash_attention_2" in s or "sdpa" in s:
+                    try:
+                        fast_kwargs.pop("attn_implementation", None)
+                        model, model_class = _load_with_retry(fast_kwargs)
+                        model.to("cuda")
+                        used_device_map = False
+                        report["warnings"].append("attn_implementation removed after load failure")
+                    except Exception:
+                        model = None
+                else:
+                    raise
+
+    if model is None:
+        # Normal path: load with (potentially) device_map/offload/quant.
+        report["load_kwargs"] = _jsonable(dict(load_kwargs))
+        try:
+            brief = {k: load_kwargs.get(k) for k in ("local_files_only", "device_map", "max_memory", "torch_dtype", "attn_implementation") if k in load_kwargs}
+            print(f"[INFO] pylittle.hf: loading model ({brief})", file=sys.stderr, flush=True)
+        except Exception:
+            pass
+        try:
+            model, model_class = _load_with_retry(load_kwargs)
+        except Exception as e:
+            # If failure is due to unsupported attention backend, retry without it.
+            s = str(e).lower()
+            if "attn_implementation" in s or "flash_attention_2" in s or "sdpa" in s:
+                report["warnings"].append("attn_implementation caused load failure; retrying without it")
+                load_kwargs2 = dict(load_kwargs)
+                load_kwargs2.pop("attn_implementation", None)
+                report["load_kwargs"] = _jsonable(dict(load_kwargs2))
+                try:
+                    brief2 = {k: load_kwargs2.get(k) for k in ("local_files_only", "device_map", "max_memory", "torch_dtype") if k in load_kwargs2}
+                    print(f"[INFO] pylittle.hf: retry loading model (no attn_implementation) ({brief2})", file=sys.stderr, flush=True)
+                except Exception:
+                    pass
+                model, model_class = _load_with_retry(load_kwargs2)
+            else:
+                raise
+
+    try:
+        print("[INFO] pylittle.hf: model loaded", file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
+    if dev == "cuda" and not used_device_map:
+        try:
+            if torch.cuda.is_available():
+                model.to(dev)
+        except Exception:
+            pass
+    model.eval()
+
+    # Optional torch.compile (PyTorch 2.x). Only safe when single-device.
+    try:
+        compile_req = bool(_get_strategy_kw(strategy, "compile_model", False))
+    except Exception:
+        compile_req = False
+    if compile_req and dev == "cuda" and not used_device_map:
+        try:
+            if hasattr(torch, "compile"):
+                model = torch.compile(model, mode="reduce-overhead")
+                report["warnings"].append("torch.compile enabled")
+        except Exception as e:
+            report["warnings"].append(f"torch.compile failed: {e}")
+
+    try:
+        report["model_class"] = model_class
+        report["is_encoder_decoder"] = bool(getattr(getattr(model, "config", None), "is_encoder_decoder", False))
+    except Exception:
+        report["model_class"] = model_class
+        report["is_encoder_decoder"] = None
+
+    # Tokenizer pad token fallback
+    try:
+        if getattr(tokenizer, "pad_token_id", None) is None and getattr(tokenizer, "eos_token_id", None) is not None:
+            tokenizer.pad_token = tokenizer.eos_token
+    except Exception:
+        pass
+
+    dm_summary = _summarize_hf_device_map(model)
+    report["used_device_map"] = bool(used_device_map)
+    report["device_map_summary"] = dm_summary
+    if used_device_map and not dm_summary:
+        report["warnings"].append("device_map requested but hf_device_map missing (accelerate not active?)")
+
+    qinfo = _quant_sanity(model, quant_requested if isinstance(quant_requested, str) else None)
+    report["quant"] = qinfo
+    if qinfo.get("quant_requested") in ("4bit", "8bit") and not qinfo.get("quant_active"):
+        report["warnings"].append("quant requested but does not appear active")
+
+    return model, tokenizer, report
+
+
+class _SyntheticByteTokenizer:
+    def __init__(self, vocab_size: int = 256):
+        self.vocab_size = vocab_size
+
+    def __call__(self, text: str, return_tensors: str = "pt"):
+        import torch
+
+        data = text.encode("utf-8", errors="ignore")
+        ids = [b % self.vocab_size for b in data] or [32]
+        input_ids = torch.tensor([ids], dtype=torch.long)
+        return {"input_ids": input_ids}
+
+    def decode(self, ids, skip_special_tokens: bool = True):
+        out_chars = []
+        for x in ids:
+            try:
+                v = int(x)
+            except Exception:
+                continue
+            if 32 <= v < 127:
+                out_chars.append(chr(v))
+            elif v in (9, 10, 13):
+                out_chars.append(chr(v))
+            else:
+                out_chars.append(" ")
+        return "".join(out_chars)
+
+
+def _make_synthetic_gpt2(device: str):
+    from transformers import GPT2Config, GPT2LMHeadModel
+
+    cfg = GPT2Config(
+        vocab_size=256,
+        n_positions=2048,
+        n_ctx=2048,
+        n_embd=256,
+        n_layer=4,
+        n_head=4,
+        bos_token_id=32,
+        eos_token_id=10,
+    )
+    model = GPT2LMHeadModel(cfg)
+    model.to(device)
+    model.eval()
+    tok = _SyntheticByteTokenizer(vocab_size=256)
+    return model, tok
+
+
+def _head_candidates(model) -> tuple[int, ...] | None:
+    try:
+        cfg = getattr(model, "config", None)
+        if cfg is None:
+            return None
+        cand: list[int] = []
+        for name in ("num_key_value_heads", "num_attention_heads", "n_head"):
+            v = getattr(cfg, name, None)
+            if isinstance(v, int) and v > 0:
+                cand.append(v)
+        # unique, stable order
+        return tuple(dict.fromkeys(cand)) or None
+    except Exception:
+        return None
+
+
+def _infer_seq_dim_from_heads(k, head_candidates: tuple[int, ...] | None) -> int:
+    # Common layouts:
+    # - (B, H, S, D) => seq dim = 2
+    # - (B, S, H, D) => seq dim = 1
+    if getattr(k, "dim", lambda: 0)() != 4:
+        return 2
+    if head_candidates:
+        try:
+            if int(k.shape[1]) in head_candidates:
+                return 2
+            if int(k.shape[2]) in head_candidates:
+                return 1
+        except Exception:
+            pass
+    return 2
+
+
+def _truncate_past_kv(past_key_values, window: int, head_candidates: tuple[int, ...] | None = None):
+    if past_key_values is None or window is None or window <= 0:
+        return past_key_values
+    new_past = []
+    for layer in past_key_values:
+        if not isinstance(layer, (tuple, list)) or len(layer) < 2:
+            new_past.append(layer)
+            continue
+        k, v = layer[0], layer[1]
+        try:
+            if getattr(k, "dim", lambda: 0)() == 4 and getattr(v, "dim", lambda: 0)() == 4:
+                seq_dim = _infer_seq_dim_from_heads(k, head_candidates)
+                slicer = [slice(None)] * 4
+                slicer[seq_dim] = slice(-window, None)
+                k2 = k[tuple(slicer)]
+                v2 = v[tuple(slicer)]
+                new_past.append((k2, v2) + tuple(layer[2:]))
+            else:
+                new_past.append(layer)
+        except Exception:
+            new_past.append(layer)
+    return tuple(new_past)
 
 
 def hf_generate(engine, model_name_or_path: str, prompt: str,
@@ -30,13 +691,13 @@ def hf_generate(engine, model_name_or_path: str, prompt: str,
                 stream: bool = True,
                 device: Optional[str] = None,
                 strategy: Optional[Dict[str, Any]] = None,
-                paging_window: Optional[int] = None) -> str | Iterator[str]:
+                paging_window: Optional[int] = None,
+                model_obj: Any | None = None,
+                tokenizer_obj: Any | None = None) -> str | Iterator[str]:
     """
     Generate text using transformers model, with PyLittle Engine providing policy/stream control.
     If stream=True, returns an iterator of text chunks; else returns the full string.
     """
-    # Lazy import to avoid imposing dependency on base install
-    from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
     import torch
 
     # Normalize device: map 'auto' to concrete device using torch availability,
@@ -48,72 +709,50 @@ def hf_generate(engine, model_name_or_path: str, prompt: str,
     else:
         dev = str(device).lower()
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
-    load_kwargs: Dict[str, Any] = {"use_safetensors": True}
-    # Apply low-VRAM strategy (quant/offload) if provided
-    used_device_map = False
-    if strategy:
-        if strategy.get("quant") in ("4bit", "8bit"):
-            try:
-                import bitsandbytes as bnb  # noqa: F401
-                load_kwargs.update({
-                    "load_in_4bit": strategy["quant"] == "4bit",
-                    "load_in_8bit": strategy["quant"] == "8bit",
-                })
-            except Exception:
-                pass  # if bnb not available, skip quant load
-    if strategy.get("offload"):
-            # accelerate-style offload
-            load_kwargs.update({
-                "device_map": "auto",
-            })
-            if strategy.get("max_memory"):
-                raw_mm = strategy["max_memory"]
-                mm: Dict[Any, Any] = {}
-                for k, v in raw_mm.items():
-                    if isinstance(k, str) and k.lower() == "cuda":
-                        mm[0] = v
-                    elif isinstance(k, str) and k.isdigit():
-                        mm[int(k)] = v
-                    else:
-                        mm[k] = v
-                load_kwargs["max_memory"] = mm
-            used_device_map = True
-
+    # If user forces CUDA but it's not available, fallback early (also affects synthetic).
     try:
-        model = AutoModelForCausalLM.from_pretrained(model_name_or_path, **load_kwargs)
-    except Exception as e:
-        raise RuntimeError(
-            f"Failed to load model with strategy {load_kwargs}: {e}. Ensure torch>=2.6 and safetensors present."
-        )
-    if dev == "cuda" and not used_device_map:
-        # When using device_map=auto, accelerate will place model modules; .to(cuda) may be unnecessary.
-        # Also, on CPU-only torch, this would throw. Try and fallback silently.
-        try:
-            import torch
-            if torch.cuda.is_available():
-                model.to(dev)
-        except Exception:
-            pass
-    model.eval()
-
-    # Prepare inputs and overlap H2D copy when using CUDA
-    try:
-        import torch
         if dev == "cuda" and not torch.cuda.is_available():
             dev = "cpu"
     except Exception:
         dev = "cpu"
 
-    if dev == "cuda" and not used_device_map:
-        import torch
-        inp_cpu = tokenizer(prompt, return_tensors="pt")  # keep on CPU
-        inputs = {}
-        # Prefer native MemoryManager async copy if available
+    used_device_map = False
+
+    if model_obj is not None or tokenizer_obj is not None:
+        if model_obj is None or tokenizer_obj is None:
+            raise ValueError("Provide both model_obj and tokenizer_obj, or neither")
+        model = model_obj
+        tokenizer = tokenizer_obj
+        is_synthetic = str(model_name_or_path).lower() in ("synthetic-gpt2", "synthetic")
+        # Infer device_map usage from the loaded model instance.
+        try:
+            used_device_map = isinstance(getattr(model, "hf_device_map", None), dict)
+        except Exception:
+            used_device_map = False
+    else:
+        is_synthetic = str(model_name_or_path).lower() in ("synthetic-gpt2", "synthetic")
+
+    if model_obj is None:
+        try:
+            model, tokenizer, load_report = hf_load_model(
+                model_name_or_path,
+                device=dev,
+                strategy=strategy,
+                engine_device_hint=getattr(engine, "_device", None),
+            )
+            used_device_map = bool(load_report.get("used_device_map"))
+        except Exception as e:
+            raise RuntimeError(f"Failed to load model '{model_name_or_path}': {e}")
+
+    # Prepare inputs and overlap H2D copy when using CUDA (hub models only).
+    if dev == "cuda" and not used_device_map and not is_synthetic and model_obj is None:
+        inp_cpu = tokenizer(prompt, return_tensors="pt")
+        inputs: Dict[str, Any] = {}
+
         if _NativeMM is not None:
             try:
                 mm = _NativeMM()
-                has_cuda = getattr(mm, "has_cuda", lambda: False)()
+                has_cuda = bool(getattr(mm, "has_cuda", lambda: False)())
             except Exception:
                 mm = None
                 has_cuda = False
@@ -122,38 +761,168 @@ def hf_generate(engine, model_name_or_path: str, prompt: str,
             has_cuda = False
 
         if mm is not None and has_cuda:
-            stream = mm.create_stream()
+            mm_stream = mm.create_stream()
             try:
                 for k, t in inp_cpu.items():
                     if not hasattr(t, "data_ptr"):
-                        # non-tensor entries (if any)
                         inputs[k] = t
                         continue
                     tc = t.contiguous()
-                    dst = tc.to("cuda")  # allocate on device with same dtype/shape
+                    dst = tc.to("cuda")
                     nbytes = int(tc.element_size() * tc.numel())
-                    ok = mm.copy_to_device_async(int(dst.data_ptr()), int(tc.data_ptr()), nbytes, stream)
+                    ok = mm.copy_to_device_async(int(dst.data_ptr()), int(tc.data_ptr()), nbytes, mm_stream)
                     if not ok:
-                        # fallback to non_blocking torch copy
                         dst = tc.to("cuda", non_blocking=True)
                     inputs[k] = dst
-                mm.synchronize_stream(stream)
+                mm.synchronize_stream(mm_stream)
             finally:
-                if stream is not None:
-                    mm.destroy_stream(stream)
+                if mm_stream is not None:
+                    mm.destroy_stream(mm_stream)
         else:
-            # Torch stream-based overlap
             s_copy = torch.cuda.Stream()
             with torch.cuda.stream(s_copy):
-                inputs = {k: (v.to("cuda", non_blocking=True) if hasattr(v, "to") else v)
-                          for k, v in tokenizer(prompt, return_tensors="pt").items()}
+                inputs = {
+                    k: (v.to("cuda", non_blocking=True) if hasattr(v, "to") else v)
+                    for k, v in tokenizer(prompt, return_tensors="pt").items()
+                }
             torch.cuda.current_stream().wait_stream(s_copy)
     else:
-        inputs = tokenizer(prompt, return_tensors="pt").to(dev)
+        raw = tokenizer(prompt, return_tensors="pt")
+        target_dev = dev
+        if used_device_map and not is_synthetic:
+            target_dev = _input_device_for_model(model, fallback=dev)
+        if hasattr(raw, "to"):
+            inputs = raw.to(target_dev)
+        else:
+            inputs = {k: (v.to(target_dev) if hasattr(v, "to") else v) for k, v in raw.items()}
 
+    # KV-window (or synthetic) decode path. Only safe when model is on a single device and decoder-only.
+    is_enc_dec = False
+    try:
+        is_enc_dec = bool(getattr(getattr(model, "config", None), "is_encoder_decoder", False))
+    except Exception:
+        is_enc_dec = False
+
+    if (is_synthetic or (paging_window and int(paging_window) > 0)) and not used_device_map and not is_enc_dec:
+        window = int(paging_window) if (paging_window and int(paging_window) > 0) else None
+        head_cand = _head_candidates(model)
+        kv_bytes_per_tok = _estimate_kv_bytes_per_token(model)
+
+        # Native pager prototype (bookkeeping only): track KV growth and sliding-window residency.
+        pager = None
+        seq_id = 0
+        pager_state: Optional[dict] = None
+        if _NativeMM is not None and _NativePager is not None and window is not None:
+            try:
+                if bool(_get_strategy_kw(strategy, "use_native_kv_pager", False)):
+                    mm = _NativeMM()
+                    page_bytes = int(_get_strategy_kw(strategy, "kv_pager_page_bytes", 2 * 1024 * 1024) or (2 * 1024 * 1024))
+                    pager = _NativePager(mm, page_bytes)
+                    pager.add_sequence(seq_id)
+                    pager_state = {"stats": None}
+            except Exception:
+                pager = None
+
+        def _iter_stream() -> Iterator[str]:
+            input_ids = inputs["input_ids"]
+            past = None
+            with torch.inference_mode():
+                for _ in range(max_new_tokens):
+                    cur_ids = input_ids if past is None else input_ids[:, -1:]
+
+                    past = _maybe_to_cache(past)
+                    past_len = _cache_seq_len(past, head_cand)
+
+                    attn = torch.ones(
+                        (cur_ids.shape[0], past_len + cur_ids.shape[1]),
+                        device=cur_ids.device,
+                        dtype=torch.long,
+                    )
+                    try:
+                        if hasattr(model, "prepare_inputs_for_generation"):
+                            model_inputs = model.prepare_inputs_for_generation(
+                                cur_ids,
+                                past_key_values=past,
+                                attention_mask=attn,
+                                use_cache=True,
+                            )
+                        else:
+                            model_inputs = {
+                                "input_ids": cur_ids,
+                                "attention_mask": attn,
+                                "past_key_values": past,
+                                "use_cache": True,
+                            }
+                    except Exception:
+                        model_inputs = {
+                            "input_ids": cur_ids,
+                            "attention_mask": attn,
+                            "past_key_values": past,
+                            "use_cache": True,
+                        }
+
+                    out = model(**model_inputs)
+                    logits = out.logits[:, -1, :]
+                    next_id = _sample_next_token(logits, temperature)
+                    input_ids = torch.cat([input_ids, next_id.unsqueeze(1)], dim=1)
+                    past = out.past_key_values
+                    past = _maybe_to_cache(past)
+                    if window is not None:
+                        past = _maybe_crop_cache(past, window)
+                        if past is not None and not hasattr(past, "crop"):
+                            past = _truncate_past_kv(past, window, head_candidates=head_cand)
+
+                    # Pager bookkeeping: count KV bytes/token and request a window.
+                    if pager is not None and kv_bytes_per_tok > 0:
+                        try:
+                            if hasattr(pager, "append_kv_bytes"):
+                                pager.append_kv_bytes(seq_id, int(kv_bytes_per_tok), 1)
+                            # request_window uses "recent_tokens" concept
+                            pager.request_window(seq_id, int(window))
+                            if pager_state is not None:
+                                pager_state["stats"] = str(pager.stats())
+                        except Exception:
+                            pass
+
+                    txt = tokenizer.decode([int(next_id.item())], skip_special_tokens=True)
+                    if txt:
+                        _maybe_simulate_pcie(strategy, 1, kv_bytes_per_tok)
+                        yield txt
+
+        if stream:
+            wrapped = _StreamWithMetrics(_iter_stream())
+            wrapped.kv_pager_state = pager_state
+            return wrapped
+        return "".join(list(_iter_stream()))
+
+    # Default transformers generation
     if stream:
-        streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
-        with torch.no_grad():
+        from transformers import TextIteratorStreamer
+
+        class _CountingStreamer(TextIteratorStreamer):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.tokens_generated = 0
+                self._t0 = time.perf_counter()
+                self.time_to_first_token_s = None
+
+            def put(self, value):
+                try:
+                    n = int(value.shape[-1])
+                except Exception:
+                    try:
+                        n = len(value)
+                    except Exception:
+                        n = 0
+                if self.tokens_generated == 0 and self.time_to_first_token_s is None:
+                    self.time_to_first_token_s = time.perf_counter() - self._t0
+                self.tokens_generated += max(0, n)
+                kv_bytes_per_tok = _estimate_kv_bytes_per_token(model)
+                _maybe_simulate_pcie(strategy, max(1, n), kv_bytes_per_tok)
+                return super().put(value)
+
+        streamer = _CountingStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+        with torch.inference_mode():
             _ = model.generate(
                 **inputs,
                 do_sample=True,
@@ -161,23 +930,6 @@ def hf_generate(engine, model_name_or_path: str, prompt: str,
                 max_new_tokens=max_new_tokens,
                 streamer=streamer,
             )
-        # Optionally wrap with pager updates
-        if paging_window and _NativePager is not None:
-            mm = _NativeMM() if _NativeMM is not None else None
-            pager = _NativePager(mm, 256 * 1024) if mm is not None else None
-            seq_id = 1
-            if pager is not None:
-                pager.add_sequence(seq_id)
-                def _gen():
-                    for chunk in streamer:
-                        # append simulated KV bytes (len bytes) and request window
-                        try:
-                            pager.append_kv(seq_id, chunk.encode('utf-8'))
-                            pager.request_window(seq_id, int(paging_window))
-                        except Exception:
-                            pass
-                        yield chunk
-                return _gen()
         return streamer
     else:
         with torch.no_grad():

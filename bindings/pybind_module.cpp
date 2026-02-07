@@ -35,6 +35,7 @@ PYBIND11_MODULE(_pylittle, m) {
 	py::class_<KVPager>(m, "KVPager")
 		.def(py::init<MemoryManager*, size_t>(), py::arg("mm"), py::arg("page_bytes"))
 		.def("add_sequence", &KVPager::add_sequence, py::arg("seq_id"))
+		.def("append_kv_bytes", &KVPager::append_kv_bytes, py::arg("seq_id"), py::arg("bytes"), py::arg("tokens"))
 		.def("append_kv", [](KVPager& self, int seq_id, py::bytes data) {
 			std::string s = data; self.append_kv(seq_id, s.data(), s.size());
 		}, py::arg("seq_id"), py::arg("data"))

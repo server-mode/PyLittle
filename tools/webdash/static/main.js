@@ -121,7 +121,19 @@ function renderSummaryTable(data){
   const p = data.pylittle || {};
   const dev = data.devices || {};
   const strategy = data.strategy || null;
+  const load = data.pylittle_load || null;
   const vram = data.vram_delta_mb ?? 'n/a';
+
+  function fmtLoad(x){
+    if (!x) return 'n/a';
+    const q = x.quant || {};
+    const dm = x.device_map_summary ? JSON.stringify(x.device_map_summary) : 'none';
+    const warn = (x.warnings && x.warnings.length) ? ` | WARN: ${x.warnings.join('; ')}` : '';
+    const qr = q.quant_requested ?? 'none';
+    const qa = (q.quant_active == null) ? 'n/a' : (q.quant_active ? 'active' : 'inactive');
+    const off = x.used_device_map ? 'device_map=auto' : 'no device_map';
+    return `quant=${qr} (${qa}), ${off}, device_map_summary=${dm}${warn}`;
+  }
 
   // Build a readable table
   const rows = [
@@ -130,10 +142,17 @@ function renderSummaryTable(data){
       ? ['Latency (s)', `Vanilla: ${fmt(v.latency_s)} | PyLittle: ${fmt(p.latency_s)} | Speedup: ${fmt(data.speedup_x)}`]
       : ['Throughput (chars/s)', `Vanilla: ${fmt(v.throughput_chars_s)} | PyLittle: ${fmt(p.throughput_chars_s)}`],
     ['VRAM Δ (MB)', `${vram}`],
+    (v.nvml_peak && v.nvml_peak.peak_mb != null) || (p.nvml_peak && p.nvml_peak.peak_mb != null)
+      ? ['Peak VRAM (NVML, MB)', `Vanilla: ${fmt(v?.nvml_peak?.peak_mb)} | PyLittle: ${fmt(p?.nvml_peak?.peak_mb)}`]
+      : null,
+    (v.time_to_first_token_s != null) || (p.time_to_first_token_s != null)
+      ? ['TTFT (s)', `Vanilla: ${fmt(v.time_to_first_token_s)} | PyLittle: ${fmt(p.time_to_first_token_s)}`]
+      : null,
     ['Độ dài output', `Vanilla len: ${v.len ?? 'n/a'} | PyLittle len: ${p.len ?? 'n/a'}`],
     ['Tokens', `Generated: ${orNA(v.tokens_generated)} | Requested: ${orNA(p.tokens_requested)}`],
     ['Chiến lược', strategy ? JSON.stringify(strategy) : '(none)'],
-  ];
+    ['Quant/offload sanity', fmtLoad(load)],
+  ].filter(Boolean);
 
   wrap.innerHTML = `<table>
     <thead><tr><th>Mục</th><th>Giá trị</th></tr></thead>

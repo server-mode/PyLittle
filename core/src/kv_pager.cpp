@@ -11,25 +11,37 @@ void KVPager::add_sequence(int seq_id) {
 }
 
 void KVPager::append_kv(int seq_id, const void* data, size_t bytes) {
+    (void)data;
+    // Back-compat: treat bytes as tokens for the old demo API.
+    append_kv_bytes(seq_id, bytes, bytes);
+}
+
+void KVPager::append_kv_bytes(int seq_id, size_t bytes, size_t tokens) {
     auto& pages = seq_pages_[seq_id];
-    // If no pages or last is full, create a new one
-    if (pages.empty() || pages.back().host.size() + bytes > page_bytes_) {
-        Page p; p.host.reserve(page_bytes_); p.on_gpu = false; p.tokens = 0;
+    if (pages.empty() || pages.back().host_bytes + bytes > page_bytes_) {
+        Page p; p.host_bytes = 0; p.on_gpu = false; p.tokens = 0;
         pages.emplace_back(std::move(p));
     }
     auto& last = pages.back();
-    const char* src = reinterpret_cast<const char*>(data);
-    size_t to_copy = bytes;
-    while (to_copy > 0) {
-        size_t can = std::min(page_bytes_ - last.host.size(), to_copy);
-        last.host.insert(last.host.end(), src, src + can);
-        last.tokens += can; // simplistic: 1 byte ~ 1 token for demo
-        src += can;
-        to_copy -= can;
-        if (to_copy > 0) {
-            Page p; p.host.reserve(page_bytes_); p.on_gpu = false; p.tokens = 0;
+
+    size_t to_add = bytes;
+    size_t toks = tokens;
+    while (to_add > 0) {
+        size_t can = std::min(page_bytes_ - last.host_bytes, to_add);
+        last.host_bytes += can;
+        // Distribute tokens proportionally if bytes span multiple pages.
+        size_t tok_can = (to_add > 0) ? (toks * can / to_add) : 0;
+        last.tokens += tok_can;
+        to_add -= can;
+        toks -= tok_can;
+        if (to_add > 0) {
+            Page p; p.host_bytes = 0; p.on_gpu = false; p.tokens = 0;
             pages.emplace_back(std::move(p));
         }
+    }
+    // Any remaining tokens (rounding) go to last page.
+    if (!pages.empty()) {
+        pages.back().tokens += toks;
     }
 }
 
@@ -60,7 +72,7 @@ void KVPager::evict_lru(size_t target_free_bytes) {
         if (idx >= 0 && static_cast<size_t>(idx) < pages.size()) {
             if (pages[static_cast<size_t>(idx)].on_gpu) {
                 pages[static_cast<size_t>(idx)].on_gpu = false; // unpin
-                freed += pages[static_cast<size_t>(idx)].host.size();
+                freed += pages[static_cast<size_t>(idx)].host_bytes;
             }
         }
     }
@@ -71,7 +83,7 @@ std::string KVPager::stats() const {
     for (const auto& kv : seq_pages_) {
         for (const auto& pg : kv.second) {
             total += 1;
-            if (pg.on_gpu) { on_gpu += 1; bytes_gpu += pg.host.size(); }
+            if (pg.on_gpu) { on_gpu += 1; bytes_gpu += pg.host_bytes; }
         }
     }
     std::ostringstream oss;
