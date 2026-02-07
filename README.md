@@ -1,8 +1,25 @@
 # PyLittle
 
-PyLittle is a Python-first, hardware-aware LLM inference library built to run big models on modest machines (e.g., 6–8GB VRAM) efficiently. It targets near-GPU-class performance on low-VRAM hardware via quantization, offload, and aggressive memory scheduling, while exposing a simple Python API.
+PyLittle is a Python-first, hardware-aware LLM inference library focused on *making real Hugging Face models usable and measurable on modest GPUs* (e.g. 6–8GB VRAM, “mining” GPUs on risers, weak PCIe links). Today, PyLittle ships a HF runtime adapter + benchmarking/reporting tools; native kernels/backends are still under active development.
 
 Status: Milestone 0/1 in-progress. Python API and HF integration are usable; native core/backends are under active development.
+
+## What’s working today
+
+- HF adapter with low-VRAM-friendly defaults
+	- Safetensors-first loading; prefers fp16 on CUDA when not quantized.
+	- Attention backend selection: prefers `flash_attention_2` when installed, else SDPA.
+	- Optional offload plan (`device_map=auto` + `max_memory`) when enabled by strategy.
+- Benchmarking with real-time metrics
+	- `tokens_s`, TTFT (time-to-first-token), peak VRAM (NVML + torch CUDA peak), and prefill/decode split.
+	- Automatic `PASS/FAIL` verdict in JSON (fit + speed gate).
+- Hardware simulation (best-effort)
+	- Simulated VRAM cap via `torch.cuda.set_per_process_memory_fraction`.
+	- Simulated weak PCIe (e.g. PCIe 1.1 x4) via per-token sleep proportional to estimated KV traffic.
+- GUI report window
+	- Tkinter table view that runs benchmarks and displays key metrics + verdict.
+- KV paging prototype (bookkeeping)
+	- Optional native KV pager *stats* during manual decode (prototype; not yet integrated into attention kernels).
 
 ## Breakthrough features (vision and ongoing implementation)
 
@@ -37,7 +54,7 @@ print(eng.generate("Hello", max_tokens=8).text)
 
 Until native kernels land, PyLittle can drive Hugging Face models with a low-VRAM strategy (bitsandbytes 4/8-bit + accelerate offload + safetensors):
 
-- Install optional deps: `transformers`, `safetensors`, `accelerate`, `bitsandbytes`, `pynvml` (for GPU stats).
+- Install optional deps: `transformers`, `safetensors`, `accelerate`, `bitsandbytes`, and one of `nvidia-ml-py`/`pynvml` (for GPU stats).
 - Use the benchmark harness with an automatic low-VRAM plan:
 
 ```powershell
@@ -69,6 +86,54 @@ Outputs include:
 - GPU stats (when `pynvml` present): util/temp/mem
 - `vram_delta_mb`: estimated VRAM change during run
 
+### Presets (fast way to test real models)
+
+```powershell
+python d:\PyLittle\tools\bench_hf_vs_pylittle.py --preset 1b --device cuda --strategy low_vram_auto --stream --tokens 64
+```
+
+Available presets: `synthetic`, `tiny`, `350m`, `410m`, `1b`.
+
+### GUI report window
+
+```powershell
+python d:\PyLittle\tools\gui_bench_report.py
+```
+
+### Simulate 6–8GB VRAM + “mining GPU” PCIe
+
+This is useful for GPUs running on risers (x1/x4) or old platforms with slow PCIe.
+
+```powershell
+# Simulate an 8GB-cap GPU and PCIe 1.1 x4 (≈ 1.0 GB/s)
+python d:\PyLittle\tools\bench_hf_vs_pylittle.py --preset 1b --device cuda --strategy low_vram_auto --stream --tokens 64 --sim-vram-mb 8192 --sim-pcie-gen 1.1 --sim-pcie-lanes 4
+
+# Simulate a tighter 6GB budget
+python d:\PyLittle\tools\bench_hf_vs_pylittle.py --preset 410m --device cuda --strategy low_vram_auto --stream --tokens 64 --sim-vram-mb 6144
+```
+
+Notes:
+- The VRAM cap is best-effort and not a true physical limit.
+- PCIe simulation is an approximation based on estimated KV bytes/token.
+
+### Real-model example result (≥1B)
+
+On a real run with `microsoft/phi-1_5` (preset `1b`), simulated `8GB` VRAM and PCIe `1.1 x4`, PyLittle outperformed vanilla HF on both fit and decode speed (PASS verdict). Example numbers from one run:
+
+- `verdict.pass = true`
+- Decode throughput: vanilla `decode_tokens_s ≈ 38`, PyLittle `decode_tokens_s ≈ 71`
+- Peak VRAM (NVML): ~`4.7GB` on both paths under the simulated cap
+
+These numbers vary by GPU, driver, and PyTorch/Transformers versions; treat them as a sanity-check baseline.
+
+### Offline / cache-only runs
+
+If you already have the model in your HF cache, you can force “no downloads”:
+
+```powershell
+python d:\PyLittle\tools\bench_hf_vs_pylittle.py --preset 1b --device cuda --strategy low_vram_auto --stream --tokens 64 --local-files-only
+```
+
 ## Roadmap (milestones)
 
 See `docs/architecture.md`. Highlights:
@@ -92,7 +157,8 @@ See `docs/how_to_build.md` for CMake and bindings. Pybind11 bindings build is op
 
 - `transformers`, `safetensors`, `accelerate`: HF runtime integration and offload
 - `bitsandbytes`: 4-bit/8-bit quantized loading
-- `pynvml`: GPU telemetry for benchmarks and safety policies
+- `nvidia-ml-py` (or `pynvml`): GPU telemetry for benchmarks and safety policies
+- `flash_attn`: optional FlashAttention2 backend (when compatible)
 
 ## License
 
