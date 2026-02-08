@@ -202,6 +202,188 @@ def _summarize_hf_device_map(model) -> Dict[str, int] | None:
         return None
 
 
+def _get_attr_path(obj: Any, path: str) -> Any:
+    cur = obj
+    for part in str(path).split("."):
+        if not hasattr(cur, part):
+            return None
+        cur = getattr(cur, part)
+    return cur
+
+
+def _build_static_device_map(model: Any, cuda_layers: int) -> tuple[Dict[str, str] | None, list[str]]:
+    """Build a deterministic (static) layer pinning map.
+
+    This is a best-effort helper to reduce offload thrash on weak PCIe by pinning a prefix
+    of transformer layers on CUDA and keeping the rest on CPU.
+
+    Returns: (device_map, warnings)
+    """
+    warnings: list[str] = []
+    try:
+        n = int(cuda_layers)
+    except Exception:
+        n = 0
+    if n <= 0:
+        warnings.append("static_layer_map requested but static_cuda_layers<=0")
+        return None, warnings
+
+    blocks = None
+    prefix = None
+    try:
+        if _get_attr_path(model, "model.layers") is not None:
+            blocks = _get_attr_path(model, "model.layers")
+            prefix = "model.layers"
+        elif _get_attr_path(model, "transformer.h") is not None:
+            blocks = _get_attr_path(model, "transformer.h")
+            prefix = "transformer.h"
+        elif _get_attr_path(model, "gpt_neox.layers") is not None:
+            blocks = _get_attr_path(model, "gpt_neox.layers")
+            prefix = "gpt_neox.layers"
+        elif _get_attr_path(model, "model.decoder.layers") is not None:
+            blocks = _get_attr_path(model, "model.decoder.layers")
+            prefix = "model.decoder.layers"
+    except Exception:
+        blocks = None
+        prefix = None
+
+    if blocks is None or prefix is None:
+        warnings.append("static_layer_map unsupported for this model architecture (no known block prefix)")
+        return None, warnings
+
+    try:
+        total_layers = len(blocks)
+    except Exception:
+        total_layers = 0
+    if total_layers <= 0:
+        warnings.append("static_layer_map could not determine number of layers")
+        return None, warnings
+
+    n = min(n, total_layers)
+    dm: Dict[str, str] = {"": "cpu"}
+
+    embed_candidates = (
+        "model.embed_tokens",
+        "model.decoder.embed_tokens",
+        "transformer.wte",
+        "transformer.wpe",
+        "gpt_neox.embed_in",
+        "embed_tokens",
+    )
+    for name in embed_candidates:
+        try:
+            if _get_attr_path(model, name) is not None:
+                dm[name] = "cuda"
+        except Exception:
+            pass
+
+    for i in range(n):
+        dm[f"{prefix}.{i}"] = "cuda"
+
+    tail_dev = "cuda" if n >= total_layers else "cpu"
+    tail_candidates = (
+        "lm_head",
+        "model.norm",
+        "model.decoder.final_layer_norm",
+        "transformer.ln_f",
+        "gpt_neox.final_layer_norm",
+    )
+    for name in tail_candidates:
+        try:
+            if _get_attr_path(model, name) is not None:
+                dm[name] = tail_dev
+        except Exception:
+            pass
+
+    warnings.append(f"static_layer_map applied: cuda_layers={n}/{total_layers}")
+    return dm, warnings
+
+
+def _auto_static_cuda_layers(model: Any, strategy: Optional[Dict[str, Any]]) -> tuple[int, list[str]]:
+    """Choose a reasonable default for static layer pinning.
+
+    Uses:
+    - model layer count (best-effort)
+    - GPU budget (sim_vram_mb if provided, else torch device total)
+    - desired_model_size_b (fp16 bytes) + quant factor if provided
+    """
+
+    warnings: list[str] = []
+    total_layers = 0
+    # Find transformer blocks to get layer count.
+    for path in ("model.layers", "transformer.h", "gpt_neox.layers", "model.decoder.layers"):
+        try:
+            blocks = _get_attr_path(model, path)
+            if blocks is not None:
+                total_layers = int(len(blocks))
+                break
+        except Exception:
+            continue
+
+    if total_layers <= 0:
+        return 4, ["static_layer_map auto: could not determine layer count; defaulting to 4"]
+
+    # VRAM budget
+    budget_b = None
+    try:
+        if strategy and isinstance(strategy, dict) and strategy.get("sim_vram_mb") is not None:
+            mb = int(strategy.get("sim_vram_mb"))
+            if mb > 0:
+                budget_b = float(mb) * 1024.0 * 1024.0
+                warnings.append(f"static_layer_map auto: using sim_vram_mb={mb}")
+    except Exception:
+        budget_b = None
+
+    if budget_b is None:
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                total = float(torch.cuda.get_device_properties(0).total_memory)
+                budget_b = total
+        except Exception:
+            budget_b = None
+
+    if budget_b is None or budget_b <= 0:
+        return min(4, total_layers), ["static_layer_map auto: cuda VRAM unknown; defaulting to 4"]
+
+    # Use a conservative fraction for weights residency.
+    weight_budget_b = float(budget_b) * 0.65
+
+    # Model size estimate
+    desired_b = None
+    try:
+        if strategy and isinstance(strategy, dict) and strategy.get("desired_model_size_b") is not None:
+            desired_b = float(strategy.get("desired_model_size_b"))
+    except Exception:
+        desired_b = None
+
+    if desired_b is None or desired_b <= 0:
+        # No size estimate; pick a small-but-not-tiny fraction.
+        n = max(1, min(total_layers, 4))
+        warnings.append("static_layer_map auto: desired_model_size_b missing; defaulting to 4")
+        return n, warnings
+
+    # Adjust for quant if requested (roughly).
+    try:
+        q = strategy.get("quant") if (strategy and isinstance(strategy, dict)) else None
+        if q == "4bit":
+            desired_b = desired_b * 0.25
+        elif q == "8bit":
+            desired_b = desired_b * 0.5
+    except Exception:
+        pass
+
+    per_layer_b = float(desired_b) / float(max(1, total_layers))
+    # Reserve some headroom.
+    per_layer_b = max(per_layer_b, 1.0)
+    n_layers = int(weight_budget_b // per_layer_b)
+    n_layers = max(1, min(total_layers, n_layers))
+
+    warnings.append(f"static_layer_map auto: chose cuda_layers={n_layers}/{total_layers} (budget~{weight_budget_b/1e9:.2f}GB)")
+    return n_layers, warnings
+
+
 def _quant_sanity(model, quant_requested: str | None) -> Dict[str, Any]:
     info: Dict[str, Any] = {
         "quant_requested": quant_requested,
@@ -305,6 +487,8 @@ def hf_load_model(
 
     is_synthetic = str(model_name_or_path).lower() in ("synthetic-gpt2", "synthetic")
     used_device_map = False
+    defer_static_dispatch = False
+    static_cuda_layers = None
     report: Dict[str, Any] = {
         "model": model_name_or_path,
         "device": dev,
@@ -314,6 +498,9 @@ def hf_load_model(
         "quant": None,
         "warnings": [],
         "load_kwargs": None,
+        "requested": None,
+        "static_layer_map": None,
+        "static_cuda_layers": None,
     }
 
     if is_synthetic:
@@ -329,6 +516,11 @@ def hf_load_model(
         local_only = bool(_get_strategy_kw(strategy, "local_files_only", False))
         offload_req = bool(_get_strategy_kw(strategy, "offload", False))
         quant_req = _get_strategy_kw(strategy, "quant", None)
+        report["requested"] = {
+            "local_files_only": local_only,
+            "offload": offload_req,
+            "quant": quant_req,
+        }
         print(
             f"[INFO] pylittle.hf: hf_load_model start model={model_name_or_path} dev={dev} local_only={local_only} offload={offload_req} quant={quant_req}",
             file=sys.stderr,
@@ -336,6 +528,19 @@ def hf_load_model(
         )
     except Exception:
         pass
+
+    # If offload was requested, Transformers typically relies on accelerate's device_map plumbing.
+    # If accelerate is missing, prefer a safe CPU fallback (rather than silently ignoring offload
+    # and then OOM-ing on CUDA).
+    offload_requested = bool(_get_strategy_kw(strategy, "offload", False))
+    if offload_requested:
+        try:
+            import accelerate  # noqa: F401
+        except Exception:
+            report["warnings"].append("accelerate not available; offload disabled and forcing CPU compute")
+            # Force compute device to CPU for this load to avoid accidental .to('cuda') later.
+            dev = "cpu"
+            report["device"] = dev
 
     tokenizer_kwargs: Dict[str, Any] = {}
     for k in ("trust_remote_code", "revision", "token", "local_files_only"):
@@ -403,35 +608,56 @@ def hf_load_model(
                 "load_in_8bit": quant_requested == "8bit",
             })
         except Exception:
-            report["warnings"].append("bitsandbytes not available; quant load flags skipped")
+            report["warnings"].append("bitsandbytes not available; quant disabled")
+            quant_requested = None
 
-    if _get_strategy_kw(strategy, "offload", False):
-        load_kwargs["device_map"] = "auto"
-        if _get_strategy_kw(strategy, "max_memory", None):
-            raw_mm = strategy["max_memory"]
-            mm: Dict[Any, Any] = {}
-            for k, v in raw_mm.items():
-                if isinstance(k, str) and k.lower() == "cuda":
-                    mm[0] = v
-                elif isinstance(k, str) and k.isdigit():
-                    mm[int(k)] = v
-                else:
-                    mm[k] = v
-            load_kwargs["max_memory"] = mm
+    if _get_strategy_kw(strategy, "offload", False) and dev != "cpu":
+        # Optional deterministic mapping: CPU load first, then dispatch with a static device_map.
+        # This is intended for weak PCIe setups where auto/offload can cause severe thrash.
+        try:
+            defer_static_dispatch = bool(_get_strategy_kw(strategy, "static_layer_map", False))
+        except Exception:
+            defer_static_dispatch = False
+        static_cuda_layers = _get_strategy_kw(strategy, "static_cuda_layers", None)
+
+        if defer_static_dispatch:
+            try:
+                import accelerate  # noqa: F401
+            except Exception:
+                defer_static_dispatch = False
+                report["warnings"].append("static_layer_map requested but accelerate not available; using device_map='auto'")
+
+        if defer_static_dispatch:
+            # Incompatible with try_fast_first: we explicitly want a device_map path.
+            try_fast_first = False
+            used_device_map = True
         else:
-            # If user is simulating a smaller GPU, enforce max_memory accordingly.
-            sim_vram_mb = _get_strategy_kw(strategy, "sim_vram_mb", None)
-            if sim_vram_mb is not None:
-                try:
-                    sim_mb = int(sim_vram_mb)
-                    if sim_mb > 0:
-                        # Keep a safety margin for allocator fragmentation.
-                        gpu_gib = max(1, int((sim_mb / 1024.0) * 0.90))
-                        load_kwargs["max_memory"] = {0: f"{gpu_gib}GiB", "cpu": "64GiB"}
-                        report["warnings"].append(f"max_memory auto-set from sim_vram_mb={sim_mb}")
-                except Exception:
-                    pass
-        used_device_map = True
+            load_kwargs["device_map"] = "auto"
+            if _get_strategy_kw(strategy, "max_memory", None):
+                raw_mm = strategy["max_memory"]
+                mm: Dict[Any, Any] = {}
+                for k, v in raw_mm.items():
+                    if isinstance(k, str) and k.lower() == "cuda":
+                        mm[0] = v
+                    elif isinstance(k, str) and k.isdigit():
+                        mm[int(k)] = v
+                    else:
+                        mm[k] = v
+                load_kwargs["max_memory"] = mm
+            else:
+                # If user is simulating a smaller GPU, enforce max_memory accordingly.
+                sim_vram_mb = _get_strategy_kw(strategy, "sim_vram_mb", None)
+                if sim_vram_mb is not None:
+                    try:
+                        sim_mb = int(sim_vram_mb)
+                        if sim_mb > 0:
+                            # Keep a safety margin for allocator fragmentation.
+                            gpu_gib = max(1, int((sim_mb / 1024.0) * 0.90))
+                            load_kwargs["max_memory"] = {0: f"{gpu_gib}GiB", "cpu": "64GiB"}
+                            report["warnings"].append(f"max_memory auto-set from sim_vram_mb={sim_mb}")
+                    except Exception:
+                        pass
+            used_device_map = True
 
     def _load_with_retry(kwargs: Dict[str, Any]):
         model_class_local = "AutoModelForCausalLM"
@@ -525,6 +751,32 @@ def hf_load_model(
                 model, model_class = _load_with_retry(load_kwargs2)
             else:
                 raise
+
+    if defer_static_dispatch:
+        try:
+            from accelerate import dispatch_model  # type: ignore
+
+            report["static_layer_map"] = True
+            if static_cuda_layers is None:
+                n_layers, warns0 = _auto_static_cuda_layers(model, strategy)
+                for w in warns0:
+                    report["warnings"].append(w)
+            else:
+                try:
+                    n_layers = int(static_cuda_layers)
+                except Exception:
+                    n_layers = 0
+            report["static_cuda_layers"] = int(n_layers)
+            dm, warns = _build_static_device_map(model, n_layers)
+            for w in warns:
+                report["warnings"].append(w)
+            if dm is None:
+                report["warnings"].append("static_layer_map could not build a device_map; keeping CPU model")
+            else:
+                model = dispatch_model(model, device_map=dm)
+                used_device_map = True
+        except Exception as e:
+            report["warnings"].append(f"static_layer_map dispatch failed: {e}")
 
     try:
         print("[INFO] pylittle.hf: model loaded", file=sys.stderr, flush=True)
@@ -808,6 +1060,10 @@ def hf_generate(engine, model_name_or_path: str, prompt: str,
         head_cand = _head_candidates(model)
         kv_bytes_per_tok = _estimate_kv_bytes_per_token(model)
 
+        kv_state: dict | None = None
+        if window is not None:
+            kv_state = {"window": int(window), "cache_seq_len": 0}
+
         # Native pager prototype (bookkeeping only): track KV growth and sliding-window residency.
         pager = None
         seq_id = 0
@@ -871,6 +1127,11 @@ def hf_generate(engine, model_name_or_path: str, prompt: str,
                         past = _maybe_crop_cache(past, window)
                         if past is not None and not hasattr(past, "crop"):
                             past = _truncate_past_kv(past, window, head_candidates=head_cand)
+                        try:
+                            if kv_state is not None:
+                                kv_state["cache_seq_len"] = int(_cache_seq_len(past, head_cand))
+                        except Exception:
+                            pass
 
                     # Pager bookkeeping: count KV bytes/token and request a window.
                     if pager is not None and kv_bytes_per_tok > 0:
@@ -892,6 +1153,10 @@ def hf_generate(engine, model_name_or_path: str, prompt: str,
         if stream:
             wrapped = _StreamWithMetrics(_iter_stream())
             wrapped.kv_pager_state = pager_state
+            try:
+                setattr(wrapped, "kv_state", kv_state)
+            except Exception:
+                pass
             return wrapped
         return "".join(list(_iter_stream()))
 

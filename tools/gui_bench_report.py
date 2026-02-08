@@ -37,6 +37,7 @@ class App(tk.Tk):
         self.sim_vram = tk.IntVar(value=8192)
         self.sim_pcie_gen = tk.StringVar(value="1.1")
         self.sim_pcie_lanes = tk.IntVar(value=4)
+        self.pcie_microbench = tk.BooleanVar(value=False)
 
         ttk.Label(top, text="Preset").grid(row=0, column=0, sticky="w")
         ttk.Combobox(top, textvariable=self.preset, values=["synthetic", "tiny", "350m", "410m", "1b"], width=12, state="readonly").grid(row=0, column=1, padx=6)
@@ -64,6 +65,8 @@ class App(tk.Tk):
 
         ttk.Label(sim, text="Lanes").grid(row=0, column=4, sticky="w", padx=6)
         ttk.Entry(sim, textvariable=self.sim_pcie_lanes, width=6).grid(row=0, column=5, padx=6)
+
+        ttk.Checkbutton(sim, text="PCIe microbench (đo thật)", variable=self.pcie_microbench).grid(row=0, column=6, sticky="w", padx=10)
 
         btns = ttk.Frame(self)
         btns.pack(fill=tk.X, padx=10, pady=8)
@@ -125,11 +128,42 @@ class App(tk.Tk):
             if rs:
                 row("verdict_reasons", "; ".join(map(str, rs)), "; ".join(map(str, rs)))
 
+        lr = data.get("pylittle_load") or {}
+        if isinstance(lr, dict):
+            if lr.get("static_layer_map") is not None:
+                row("static_layer_map", lr.get("static_layer_map"), lr.get("static_layer_map"))
+            if lr.get("static_cuda_layers") is not None:
+                row("static_cuda_layers", lr.get("static_cuda_layers"), lr.get("static_cuda_layers"))
+
         sim = data.get("simulation") or {}
         if sim:
             row("Sim VRAM limit (MB)", (sim.get("sim_vram") or {}).get("limit_mb"), (sim.get("sim_vram") or {}).get("limit_mb"))
             sp = (sim.get("sim_pcie") or {})
             row("Sim PCIe", f"gen={sp.get('gen')} x{sp.get('lanes')} (~{sp.get('gbps')} GB/s)", f"gen={sp.get('gen')} x{sp.get('lanes')} (~{sp.get('gbps')} GB/s)")
+
+        pm = data.get("pcie_microbench") or None
+        if isinstance(pm, dict) and pm:
+            # Show largest-size steady-state bandwidth as a quick summary.
+            try:
+                szs = [int(x) for x in (pm.get("sizes_bytes") or [])]
+            except Exception:
+                szs = []
+            max_sz = max(szs) if szs else None
+            h2d = (pm.get("h2d_gbps") or {})
+            d2h = (pm.get("d2h_gbps") or {})
+            bw_h2d = h2d.get(str(max_sz)) if max_sz is not None else None
+            bw_d2h = d2h.get(str(max_sz)) if max_sz is not None else None
+            row("PCIe microbench (from_cache)", pm.get("from_cache"), pm.get("from_cache"))
+            row("PCIe BW H2D (GB/s)", bw_h2d, bw_h2d)
+            row("PCIe BW D2H (GB/s)", bw_d2h, bw_d2h)
+            try:
+                lat4k_h2d = (pm.get("h2d_latency_us") or {}).get("4096")
+                lat4k_d2h = (pm.get("d2h_latency_us") or {}).get("4096")
+            except Exception:
+                lat4k_h2d = None
+                lat4k_d2h = None
+            row("PCIe latency 4KB H2D (us)", lat4k_h2d, lat4k_h2d)
+            row("PCIe latency 4KB D2H (us)", lat4k_d2h, lat4k_d2h)
 
     def on_run(self):
         self.run_btn.configure(state="disabled")
@@ -156,6 +190,9 @@ class App(tk.Tk):
         lanes = int(self.sim_pcie_lanes.get())
         if gen and lanes > 0:
             args += ["--sim-pcie-gen", gen, "--sim-pcie-lanes", str(lanes)]
+
+        if bool(self.pcie_microbench.get()):
+            args += ["--pcie-microbench", "--pcie-microbench-cache"]
 
         def worker():
             try:

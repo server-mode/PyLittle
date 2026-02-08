@@ -10,6 +10,9 @@ __pycache__/
 *$py.class
 *.so
 
+# Native extension artifacts (copied for dev)
+python/pylittle/_pylittle*.pyd
+
 # Distribution / packaging
 .Python
 build/

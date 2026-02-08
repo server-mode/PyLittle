@@ -19,6 +19,7 @@ from pylittle import Engine, config
 from pylittle.adapters.hf_runtime import hf_generate, hf_load_model
 from pylittle.utils.metrics import stopwatch, gpu_stats, nvml_peak_memory, torch_cuda_peak_memory
 from pylittle.utils.simulate import simulated_cuda_vram_limit, pcie_gen_lanes_to_gbps, simulate_pcie_sleep
+from pylittle.utils.pcie_microbench import pcie_microbench_cached
 
 
 def run_vanilla(model: str, prompt: str, tokens: int, temperature: float, device: str, stream: bool = False, *, local_files_only: bool = False):
@@ -313,6 +314,8 @@ def run_pylittle(model: str, prompt: str, tokens: int, temperature: float, devic
         if desired_b is None:
             desired_b = int(14e9)
         plan = config.budgeter(desired_model_size_b=int(desired_b), target_device=device)
+        if isinstance(plan, dict):
+            plan["desired_model_size_b"] = int(desired_b)
         if plan and no_quant:
             plan["quant"] = None
         if plan and no_offload:
@@ -323,6 +326,10 @@ def run_pylittle(model: str, prompt: str, tokens: int, temperature: float, devic
     elif strategy_name == "gpu_only":
         # Force GPU-only: no offload, optional 4bit quant; keep device cuda
         plan = {"device": "cuda", "quant": None if no_quant else "4bit", "offload": False}
+        if isinstance(plan, dict):
+            desired_b = globals().get("_MODEL_SIZE_B")
+            if desired_b is not None:
+                plan["desired_model_size_b"] = int(desired_b)
 
     # Optional: enable torch.compile for PyLittle (single-GPU only; set by main)
     try:
@@ -366,6 +373,20 @@ def run_pylittle(model: str, prompt: str, tokens: int, temperature: float, devic
 
             if bool(globals().get("_LOCAL_FILES_ONLY", False)):
                 plan["local_files_only"] = True
+
+            # Optional: real PCIe microbench + heuristics (deep strategy for weak PCIe).
+            pcie_bw = globals().get("_PCIE_BW_GBPS")
+            pcie_lat = globals().get("_PCIE_LAT_US")
+            if pcie_bw is not None:
+                plan["pcie_bw_gbps"] = float(pcie_bw)
+            if pcie_lat is not None:
+                plan["pcie_latency_us"] = float(pcie_lat)
+
+            static_force = bool(globals().get("_STATIC_LAYER_MAP_FORCE", False))
+            weak = bool(globals().get("_PCIE_WEAK", False))
+            if plan.get("offload") and (static_force or weak):
+                plan["static_layer_map"] = True
+                plan["static_cuda_layers"] = int(globals().get("_STATIC_CUDA_LAYERS", 4))
     except Exception:
         pass
 
@@ -402,6 +423,12 @@ def run_pylittle(model: str, prompt: str, tokens: int, temperature: float, devic
         except Exception:
             kv_pager_stats = None
 
+        kv_state = None
+        try:
+            kv_state = getattr(stream_it, "kv_state", None)
+        except Exception:
+            kv_state = None
+
         # Token-level count if available (CountingStreamer); fallback to step count for manual decode.
         total_tokens = getattr(stream_it, "tokens_generated", None)
         if total_tokens is None:
@@ -419,6 +446,7 @@ def run_pylittle(model: str, prompt: str, tokens: int, temperature: float, devic
             "total_time_s": dt,
             "time_to_first_token_s": getattr(stream_it, "time_to_first_token_s", None),
             "kv_pager_stats": kv_pager_stats,
+            "kv_state": kv_state,
             "nvml_peak": (nvml_peak.as_dict() if nvml_peak is not None else None),
             "cuda_peak": cuda_peak,
             "load": load_report,
@@ -459,7 +487,93 @@ def main():
     ap.add_argument("--sim-pcie-gen", default=None, help="Simulate PCIe generation (e.g. 1.1, 2.0, 3.0, 4.0).")
     ap.add_argument("--sim-pcie-lanes", type=int, default=None, help="Simulate PCIe lanes (e.g. 4 for x4).")
     ap.add_argument("--sim-pcie-overhead-us", type=float, default=50.0, help="Per-token PCIe latency overhead (microseconds).")
+    ap.add_argument("--pcie-microbench", action="store_true", help="Measure real H2D/D2H bandwidth/latency with torch copies and include in JSON.")
+    ap.add_argument("--pcie-microbench-iters", type=int, default=50, help="Iterations per size for --pcie-microbench.")
+    ap.add_argument("--pcie-microbench-sizes", default="4096,1048576,67108864", help="Comma-separated sizes in bytes for --pcie-microbench.")
+    ap.add_argument("--pcie-microbench-cache", action="store_true", default=True, help="(Alias; default-on) Cache PCIe microbench results in outputs/.")
+    ap.add_argument("--pcie-microbench-no-cache", action="store_true", help="Disable PCIe microbench caching.")
+    ap.add_argument("--pcie-microbench-cache-ttl-s", type=float, default=7*24*3600, help="TTL seconds for --pcie-microbench-cache.")
+    ap.add_argument("--pcie-weak-threshold-gbps", type=float, default=2.0, help="If measured PCIe GB/s is below this and offload is on, enable static layer map.")
+    ap.add_argument("--static-layer-map", action="store_true", help="Force static layer pinning map when offload is on (requires accelerate).")
+    ap.add_argument("--static-cuda-layers", type=int, default=4, help="How many early transformer layers to pin on CUDA for static layer map.")
     args = ap.parse_args()
+
+    # Globals used to pass auxiliary info into helpers without changing many signatures.
+    global _PCIE_BW_GBPS, _PCIE_LAT_US, _PCIE_WEAK
+    global _STATIC_LAYER_MAP_FORCE, _STATIC_CUDA_LAYERS
+
+    pcie_report = None
+    if bool(args.pcie_microbench):
+        try:
+            sizes = [int(x.strip()) for x in str(args.pcie_microbench_sizes).split(",") if x.strip()]
+        except Exception:
+            sizes = [4096, 1 << 20, 64 << 20]
+        if not bool(args.pcie_microbench_no_cache):
+            pcie_report = pcie_microbench_cached(
+                cache_path=None,
+                ttl_s=float(args.pcie_microbench_cache_ttl_s),
+                device="cuda",
+                sizes_bytes=sizes,
+                iters=int(args.pcie_microbench_iters),
+                warmup=10,
+                pinned=True,
+            )
+        else:
+            # No-cache mode: write to a per-run cache file so nothing is reused.
+            import time as _time
+            pcie_report = pcie_microbench_cached(
+                cache_path=f"outputs/pcie_microbench_cache_run_{int(_time.time())}.json",
+                ttl_s=0.0,
+                device="cuda",
+                sizes_bytes=sizes,
+                iters=int(args.pcie_microbench_iters),
+                warmup=10,
+                pinned=True,
+            )
+
+        # Derive a single "effective" bandwidth and latency heuristic.
+        try:
+            h2d = pcie_report.get("h2d_gbps") or {}
+            d2h = pcie_report.get("d2h_gbps") or {}
+            # Use the largest tested size as the steady-state bandwidth proxy.
+            szs = [int(x) for x in (pcie_report.get("sizes_bytes") or [])]
+            max_sz = max(szs) if szs else (64 << 20)
+            bw_h2d = float(h2d.get(str(max_sz))) if h2d.get(str(max_sz)) is not None else None
+            bw_d2h = float(d2h.get(str(max_sz))) if d2h.get(str(max_sz)) is not None else None
+            eff_bw = None
+            if bw_h2d is not None and bw_d2h is not None:
+                eff_bw = min(bw_h2d, bw_d2h)
+            elif bw_h2d is not None:
+                eff_bw = bw_h2d
+            elif bw_d2h is not None:
+                eff_bw = bw_d2h
+
+            lat_h2d = (pcie_report.get("h2d_latency_us") or {}).get("4096")
+            lat_d2h = (pcie_report.get("d2h_latency_us") or {}).get("4096")
+            eff_lat = None
+            if lat_h2d is not None and lat_d2h is not None:
+                eff_lat = max(float(lat_h2d), float(lat_d2h))
+            elif lat_h2d is not None:
+                eff_lat = float(lat_h2d)
+            elif lat_d2h is not None:
+                eff_lat = float(lat_d2h)
+        except Exception:
+            eff_bw = None
+            eff_lat = None
+
+        _PCIE_BW_GBPS = eff_bw
+        _PCIE_LAT_US = eff_lat
+        try:
+            _PCIE_WEAK = (eff_bw is not None) and (float(eff_bw) < float(args.pcie_weak_threshold_gbps))
+        except Exception:
+            _PCIE_WEAK = False
+    else:
+        _PCIE_BW_GBPS = None
+        _PCIE_LAT_US = None
+        _PCIE_WEAK = False
+
+    _STATIC_LAYER_MAP_FORCE = bool(args.static_layer_map)
+    _STATIC_CUDA_LAYERS = int(args.static_cuda_layers)
 
     # resolve preset -> model
     preset_map = {
@@ -496,6 +610,16 @@ def main():
             sim_pcie_gbps = pcie_gen_lanes_to_gbps(args.sim_pcie_gen, args.sim_pcie_lanes)
         except Exception:
             sim_pcie_gbps = None
+
+    # If user provided a simulated PCIe setting (and we didn't run a real microbench),
+    # use it as the heuristic signal for "weak PCIe".
+    try:
+        if (_PCIE_BW_GBPS is None) and (sim_pcie_gbps is not None):
+            _PCIE_BW_GBPS = float(sim_pcie_gbps)
+            _PCIE_LAT_US = None
+            _PCIE_WEAK = float(sim_pcie_gbps) < float(args.pcie_weak_threshold_gbps)
+    except Exception:
+        pass
 
     # Expose to run_pylittle() without changing its signature.
     global _SIM_PCIE_GBPS, _SIM_PCIE_OVERHEAD_US, _SIM_VRAM_MB
@@ -581,6 +705,7 @@ def main():
                 "decode_tokens_s": p_split.get("decode_tokens_s"),
                 "time_to_first_token_s": p.get("time_to_first_token_s"),
                 "kv_pager_stats": p.get("kv_pager_stats"),
+                "kv_state": p.get("kv_state"),
                 "nvml_peak": p.get("nvml_peak"),
                 "cuda_peak": p.get("cuda_peak"),
             },
@@ -608,6 +733,9 @@ def main():
             },
         },
     })
+
+    if pcie_report is not None:
+        out["pcie_microbench"] = pcie_report
     # VRAM delta if stats available
     try:
         if base_gpu and end_gpu:
@@ -660,13 +788,32 @@ def main():
             p_ts = (out.get("pylittle") or {}).get("tokens_s")
         except Exception:
             p_ts = None
-        if p_ts is not None and v_ts is not None:
+        # Speed gate is only meaningful in the default (non-paging-window) mode.
+        if (args.paging_window is None) and p_ts is not None and v_ts is not None:
             if float(p_ts) <= float(v_ts):
                 verdict["pass"] = False if verdict["pass"] is not True else verdict["pass"]
                 verdict["reasons"].append("pylittle_tokens_s_not_greater_than_vanilla")
             else:
                 if verdict["pass"] is None:
                     verdict["pass"] = True
+
+        # Dependency sanity: if user requested quant/offload, ensure it actually activated.
+        try:
+            st = out.get("strategy") if isinstance(out, dict) else None
+            lr = out.get("pylittle_load") if isinstance(out, dict) else None
+            if isinstance(st, dict) and isinstance(lr, dict):
+                qreq = st.get("quant")
+                if qreq in ("4bit", "8bit"):
+                    qinfo = lr.get("quant") or {}
+                    if isinstance(qinfo, dict) and not bool(qinfo.get("quant_active")):
+                        verdict["pass"] = False if verdict["pass"] is not True else verdict["pass"]
+                        verdict["reasons"].append("quant_requested_but_inactive")
+                if bool(st.get("offload")):
+                    if not bool(lr.get("used_device_map")):
+                        verdict["pass"] = False if verdict["pass"] is not True else verdict["pass"]
+                        verdict["reasons"].append("offload_requested_but_device_map_unused")
+        except Exception:
+            pass
 
         # If we have a sim VRAM gate, require pylittle fit.
         if isinstance(wou, dict) and wou.get("limit_mb") is not None and wou.get("pylittle") is False:
