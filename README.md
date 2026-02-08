@@ -4,32 +4,6 @@ PyLittle is a Python-first, hardware-aware LLM inference library focused on *mak
 
 Status: Milestone 0/1 in-progress. Python API and HF integration are usable; native core/backends are under active development.
 
-## Why PyLittle exists
-
-Running modern LLMs on real-world “modest” GPUs is often less about raw TFLOPs and more about **VRAM limits, PCIe bottlenecks, and fragile configuration** (quant/offload/attention backends). PyLittle exists to make this practical and repeatable:
-
-- **Make 6–8GB VRAM setups usable** (including “mining” GPUs on risers / weak PCIe links) with sane low-VRAM defaults and offload/quant policies.
-- **Make performance measurable** with a single benchmark script that outputs TTFT, prefill vs decode, tokens/s, and peak VRAM.
-- **Make comparisons actionable** by emitting a `PASS/FAIL` verdict and the reasons, so optimizations can be regression-tested.
-- **Bridge to a native runtime**: today it wraps HF; the roadmap moves the same workflow toward native paging/overlap/kernels.
-
-## What’s working today
-
-- HF adapter with low-VRAM-friendly defaults
-	- Safetensors-first loading; prefers fp16 on CUDA when not quantized.
-	- Attention backend selection: prefers `flash_attention_2` when installed, else SDPA.
-	- Optional offload plan (`device_map=auto` + `max_memory`) when enabled by strategy.
-- Benchmarking with real-time metrics
-	- `tokens_s`, TTFT (time-to-first-token), peak VRAM (NVML + torch CUDA peak), and prefill/decode split.
-	- Automatic `PASS/FAIL` verdict in JSON (fit + speed gate).
-- Hardware simulation (best-effort)
-	- Simulated VRAM cap via `torch.cuda.set_per_process_memory_fraction`.
-	- Simulated weak PCIe (e.g. PCIe 1.1 x4) via per-token sleep proportional to estimated KV traffic.
-- GUI report window
-	- Tkinter table view that runs benchmarks and displays key metrics + verdict.
-- KV paging prototype (bookkeeping)
-	- Optional native KV pager *stats* during manual decode (prototype; not yet integrated into attention kernels).
-
 ## Breakthrough features (vision and ongoing implementation)
 
 - Low-VRAM first design
