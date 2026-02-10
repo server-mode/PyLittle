@@ -31,6 +31,13 @@ def run_vanilla(model: str, prompt: str, tokens: int, temperature: float, device
         except Exception:
             DynamicCache = None
 
+        # Avoid pulling in torchvision/sympy on text-only runs (Transformers can import vision utils transitively).
+        try:
+            import os
+
+            os.environ.setdefault("TRANSFORMERS_NO_TORCHVISION", "1")
+        except Exception:
+            pass
         if device == "cuda" and not torch.cuda.is_available():
             dev = "cpu"
         elif device == "auto" and torch.cuda.is_available():
@@ -163,11 +170,15 @@ def run_vanilla(model: str, prompt: str, tokens: int, temperature: float, device
         else:
             raise
     inp = tok(prompt, return_tensors="pt").to(dev)
+    do_sample = (temperature is not None) and (float(temperature) > 0.0)
     # warm-up (keep minimal to avoid long stalls on large models)
     with torch.no_grad():
         try:
             print(f"[INFO] vanilla: warm-up generate", file=sys.stderr, flush=True)
-            _ = mdl.generate(**inp, do_sample=True, temperature=temperature, max_new_tokens=1)
+            gen_kwargs = {"do_sample": bool(do_sample), "max_new_tokens": 1}
+            if do_sample:
+                gen_kwargs["temperature"] = float(temperature)
+            _ = mdl.generate(**inp, **gen_kwargs)
         except Exception as e:
             if dev == "cuda" and _is_cuda_oom(e):
                 dev = "cpu"
@@ -179,7 +190,7 @@ def run_vanilla(model: str, prompt: str, tokens: int, temperature: float, device
                 mdl.to(dev).eval()
                 inp = tok(prompt, return_tensors="pt")
                 print(f"[INFO] vanilla: warm-up retry on cpu", file=sys.stderr, flush=True)
-                _ = mdl.generate(**inp, do_sample=True, temperature=temperature, max_new_tokens=1)
+                _ = mdl.generate(**inp, **gen_kwargs)
             else:
                 raise
     if stream:
@@ -232,7 +243,10 @@ def run_vanilla(model: str, prompt: str, tokens: int, temperature: float, device
             with torch.no_grad():
                 t0 = perf_counter()
                 try:
-                    _ = mdl.generate(**inp, do_sample=True, temperature=temperature, max_new_tokens=tokens, streamer=streamer)
+                    gen_kwargs2 = {"do_sample": bool(do_sample), "max_new_tokens": int(tokens), "streamer": streamer}
+                    if do_sample:
+                        gen_kwargs2["temperature"] = float(temperature)
+                    _ = mdl.generate(**inp, **gen_kwargs2)
                 except Exception as e:
                     if dev == "cuda" and _is_cuda_oom(e):
                         dev = "cpu"
@@ -243,7 +257,7 @@ def run_vanilla(model: str, prompt: str, tokens: int, temperature: float, device
                             pass
                         mdl.to(dev).eval()
                         inp2 = tok(prompt, return_tensors="pt")
-                        _ = mdl.generate(**inp2, do_sample=True, temperature=temperature, max_new_tokens=tokens, streamer=streamer)
+                        _ = mdl.generate(**inp2, **gen_kwargs2)
                     else:
                         raise
                 for chunk in streamer:
@@ -270,7 +284,10 @@ def run_vanilla(model: str, prompt: str, tokens: int, temperature: float, device
         for _ in range(3):
             t0 = perf_counter()
             try:
-                out = mdl.generate(**inp, do_sample=True, temperature=temperature, max_new_tokens=tokens)
+                gen_kwargs3 = {"do_sample": bool(do_sample), "max_new_tokens": int(tokens)}
+                if do_sample:
+                    gen_kwargs3["temperature"] = float(temperature)
+                out = mdl.generate(**inp, **gen_kwargs3)
             except Exception as e:
                 if dev == "cuda" and _is_cuda_oom(e):
                     dev = "cpu"
@@ -281,7 +298,7 @@ def run_vanilla(model: str, prompt: str, tokens: int, temperature: float, device
                         pass
                     mdl.to(dev).eval()
                     inp = tok(prompt, return_tensors="pt")
-                    out = mdl.generate(**inp, do_sample=True, temperature=temperature, max_new_tokens=tokens)
+                    out = mdl.generate(**inp, **gen_kwargs3)
                 else:
                     raise
             times.append(perf_counter() - t0)
@@ -384,7 +401,12 @@ def run_pylittle(model: str, prompt: str, tokens: int, temperature: float, devic
 
             static_force = bool(globals().get("_STATIC_LAYER_MAP_FORCE", False))
             weak = bool(globals().get("_PCIE_WEAK", False))
-            if plan.get("offload") and (static_force or weak):
+            pcie_source = globals().get("_PCIE_SOURCE")
+            # Only auto-enable static mapping when weakness is based on a *real* microbench.
+            # Simulated PCIe is useful for throttling/experiments, but auto static mapping is
+            # still experimental and can interact poorly with some models/offload hooks.
+            auto_static_ok = (pcie_source == "microbench")
+            if plan.get("offload") and (static_force or (weak and auto_static_ok)):
                 plan["static_layer_map"] = True
                 plan["static_cuda_layers"] = int(globals().get("_STATIC_CUDA_LAYERS", 4))
     except Exception:
@@ -483,6 +505,7 @@ def main():
     ap.add_argument("--native-kv-pager", action="store_true", help="Enable native KVPager bookkeeping in manual decode path (prototype).")
     ap.add_argument("--kv-pager-page-bytes", type=int, default=2*1024*1024, help="Page size for native KVPager prototype.")
     ap.add_argument("--local-files-only", action="store_true", help="Only use local HF cache (no downloads).")
+    ap.add_argument("--skip-vanilla", action="store_true", help="Skip the vanilla baseline run (useful when the model would OOM without offload).")
     ap.add_argument("--sim-vram-mb", type=int, default=None, help="Simulate a smaller GPU by limiting per-process CUDA memory (MB).")
     ap.add_argument("--sim-pcie-gen", default=None, help="Simulate PCIe generation (e.g. 1.1, 2.0, 3.0, 4.0).")
     ap.add_argument("--sim-pcie-lanes", type=int, default=None, help="Simulate PCIe lanes (e.g. 4 for x4).")
@@ -499,7 +522,7 @@ def main():
     args = ap.parse_args()
 
     # Globals used to pass auxiliary info into helpers without changing many signatures.
-    global _PCIE_BW_GBPS, _PCIE_LAT_US, _PCIE_WEAK
+    global _PCIE_BW_GBPS, _PCIE_LAT_US, _PCIE_WEAK, _PCIE_SOURCE
     global _STATIC_LAYER_MAP_FORCE, _STATIC_CUDA_LAYERS
 
     pcie_report = None
@@ -567,10 +590,12 @@ def main():
             _PCIE_WEAK = (eff_bw is not None) and (float(eff_bw) < float(args.pcie_weak_threshold_gbps))
         except Exception:
             _PCIE_WEAK = False
+        _PCIE_SOURCE = "microbench"
     else:
         _PCIE_BW_GBPS = None
         _PCIE_LAT_US = None
         _PCIE_WEAK = False
+        _PCIE_SOURCE = None
 
     _STATIC_LAYER_MAP_FORCE = bool(args.static_layer_map)
     _STATIC_CUDA_LAYERS = int(args.static_cuda_layers)
@@ -618,6 +643,7 @@ def main():
             _PCIE_BW_GBPS = float(sim_pcie_gbps)
             _PCIE_LAT_US = None
             _PCIE_WEAK = float(sim_pcie_gbps) < float(args.pcie_weak_threshold_gbps)
+            _PCIE_SOURCE = "sim"
     except Exception:
         pass
 
@@ -629,8 +655,15 @@ def main():
 
     with simulated_cuda_vram_limit(args.sim_vram_mb) as sim_vram_report:
         base_gpu = gpu_stats()
-        v = run_vanilla(model, args.prompt, args.tokens, args.temperature, args.device, stream=args.stream, local_files_only=bool(args.local_files_only))
-        mid_gpu = gpu_stats()
+        if bool(args.skip_vanilla):
+            v = {
+                "skipped": True,
+                "reason": "--skip-vanilla set (baseline may OOM on low VRAM without offload)",
+            }
+            mid_gpu = base_gpu
+        else:
+            v = run_vanilla(model, args.prompt, args.tokens, args.temperature, args.device, stream=args.stream, local_files_only=bool(args.local_files_only))
+            mid_gpu = gpu_stats()
 
         # Pass PCIe throttling into the HF strategy dict (only affects HF adapter paths).
         if sim_pcie_gbps is not None:

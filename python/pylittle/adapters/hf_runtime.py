@@ -510,7 +510,98 @@ def hf_load_model(
         report["quant"] = _quant_sanity(model, None)
         return model, tokenizer, report
 
+    # Many text-only models still transitively touch vision utilities inside transformers.
+    # On small Windows setups this can pull in torchvision/sympy and make imports very slow.
+    # If users need vision models they can unset this env var.
+    try:
+        import os
+
+        os.environ.setdefault("TRANSFORMERS_NO_TORCHVISION", "1")
+    except Exception:
+        pass
+
     from transformers import AutoModelForCausalLM, AutoModelForSeq2SeqLM, AutoTokenizer
+
+    def _is_cuda_oom(e: Exception) -> bool:
+        s = str(e).lower()
+        return ("cuda out of memory" in s) or ("out of memory" in s and "cuda" in s)
+
+    def _system_total_ram_mb() -> int | None:
+        # Best-effort physical RAM detection (Windows-friendly).
+        try:
+            import ctypes
+
+            class _MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            st = _MEMORYSTATUSEX()
+            st.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)) == 0:
+                return None
+            return int(st.ullTotalPhys // (1024 * 1024))
+        except Exception:
+            return None
+
+    def _parse_mem_to_mb(v: Any) -> int | None:
+        try:
+            if v is None:
+                return None
+            if isinstance(v, (int, float)):
+                # Assume MB.
+                return int(v)
+            s = str(v).strip().lower()
+            if s.endswith("gib"):
+                return int(float(s[:-3].strip()) * 1024)
+            if s.endswith("gb"):
+                return int(float(s[:-2].strip()) * 1000)
+            if s.endswith("mib"):
+                return int(float(s[:-3].strip()))
+            if s.endswith("mb"):
+                return int(float(s[:-2].strip()))
+            return int(float(s))
+        except Exception:
+            return None
+
+    def _format_mb(mb: int) -> str:
+        return f"{int(mb)}MiB"
+
+    def _headroom_mb_for_budget(budget_mb: int) -> int:
+        if budget_mb >= 8192:
+            return 1024
+        if budget_mb >= 6144:
+            return 768
+        return 512
+
+    def _override_max_memory_for_sim(load_kwargs: Dict[str, Any], sim_vram_mb: int):
+        try:
+            mm = load_kwargs.get("max_memory")
+            if not isinstance(mm, dict):
+                mm = {}
+            safe_gpu_mb = max(512, int(sim_vram_mb) - _headroom_mb_for_budget(int(sim_vram_mb)))
+            mm[0] = _format_mb(safe_gpu_mb)
+            total_ram_mb = _system_total_ram_mb()
+            if total_ram_mb is not None and total_ram_mb > 0:
+                cpu_cap_mb = max(8192, int(total_ram_mb * 0.85))
+                cpu_cap_mb = min(cpu_cap_mb, 128 * 1024)
+                mm["cpu"] = _format_mb(cpu_cap_mb)
+            else:
+                mm["cpu"] = "64GiB"
+            load_kwargs["max_memory"] = mm
+            report["warnings"].append(
+                f"sim_vram_mb={int(sim_vram_mb)} overrides max_memory -> gpu={mm.get(0)} cpu={mm.get('cpu')}"
+            )
+        except Exception:
+            pass
 
     try:
         local_only = bool(_get_strategy_kw(strategy, "local_files_only", False))
@@ -566,7 +657,9 @@ def hf_load_model(
     if td is not None:
         try:
             if isinstance(td, str):
-                td = getattr(torch, td)
+                # Transformers accepts torch_dtype="auto".
+                if td.strip().lower() != "auto":
+                    td = getattr(torch, td)
         except Exception:
             pass
         load_kwargs["torch_dtype"] = td
@@ -589,11 +682,14 @@ def hf_load_model(
         except Exception:
             pass
 
+    offload_req_for_dtype = bool(_get_strategy_kw(strategy, "offload", False))
     quant_requested = _get_strategy_kw(strategy, "quant", None)
     # If no explicit dtype and not using bnb quant, default to fp16 on CUDA.
     if dev == "cuda" and "torch_dtype" not in load_kwargs and quant_requested not in ("4bit", "8bit"):
         try:
-            load_kwargs["torch_dtype"] = torch.float16
+            # With device_map/offload, dtype casting during shard load can be expensive and
+            # can cause large transient allocations. Prefer torch_dtype="auto".
+            load_kwargs["torch_dtype"] = "auto" if offload_req_for_dtype else torch.float16
         except Exception:
             pass
 
@@ -659,17 +755,31 @@ def hf_load_model(
                         pass
             used_device_map = True
 
+        # If we're simulating VRAM, force the GPU cap even if a profile provided max_memory.
+        try:
+            sim_vram_mb2 = _get_strategy_kw(strategy, "sim_vram_mb", None)
+            if sim_vram_mb2 is not None:
+                sim_mb2 = int(sim_vram_mb2)
+                if sim_mb2 > 0:
+                    _override_max_memory_for_sim(load_kwargs, sim_mb2)
+                    # Under a simulated low VRAM cap, a fast full-GPU attempt is very likely
+                    # to OOM and can fragment the allocator. Prefer direct device_map load.
+                    try_fast_first = False
+                    report["warnings"].append("try_fast_cuda_first disabled due to sim_vram_mb")
+        except Exception:
+            pass
+
     def _load_with_retry(kwargs: Dict[str, Any]):
+        # Only fall back to Seq2Seq when the config/type indicates that's required.
         model_class_local = "AutoModelForCausalLM"
         try:
             return AutoModelForCausalLM.from_pretrained(model_name_or_path, **kwargs), model_class_local
-        except Exception:
-            model_class_local = "AutoModelForSeq2SeqLM"
-            return AutoModelForSeq2SeqLM.from_pretrained(model_name_or_path, **kwargs), model_class_local
-
-    def _is_cuda_oom(e: Exception) -> bool:
-        s = str(e).lower()
-        return ("cuda out of memory" in s) or ("out of memory" in s and "cuda" in s)
+        except ValueError as e:
+            s = str(e)
+            if ("Unrecognized configuration class" in s) or ("for this kind of AutoModel" in s):
+                model_class_local = "AutoModelForSeq2SeqLM"
+                return AutoModelForSeq2SeqLM.from_pretrained(model_name_or_path, **kwargs), model_class_local
+            raise
 
     # If offload requested, optionally try a fast single-GPU load first (fp16, no device_map)
     # to maximize tokens/s when the model actually fits.
@@ -734,7 +844,41 @@ def hf_load_model(
         except Exception:
             pass
         try:
-            model, model_class = _load_with_retry(load_kwargs)
+            # If device_map/offload is in use, retry CUDA OOM by lowering GPU max_memory.
+            attempt_kwargs = dict(load_kwargs)
+            retries = [1.0, 0.9, 0.8]
+            last_e = None
+            for r in retries:
+                try:
+                    if r != 1.0 and isinstance(attempt_kwargs.get("max_memory"), dict) and 0 in attempt_kwargs["max_memory"]:
+                        mb0 = _parse_mem_to_mb((attempt_kwargs.get("max_memory") or {}).get(0))
+                        if mb0 is not None:
+                            mm0 = dict(attempt_kwargs.get("max_memory") or {})
+                            mm0[0] = _format_mb(max(512, int(mb0 * r)))
+                            attempt_kwargs = dict(attempt_kwargs)
+                            attempt_kwargs["max_memory"] = mm0
+                            report["warnings"].append(f"CUDA OOM retry: lowering max_memory[0] -> {mm0[0]}")
+                    model, model_class = _load_with_retry(attempt_kwargs)
+                    break
+                except Exception as e:
+                    last_e = e
+                    if _is_cuda_oom(e) and used_device_map and dev == "cuda":
+                        try:
+                            import gc
+
+                            gc.collect()
+                        except Exception:
+                            pass
+                        try:
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                        except Exception:
+                            pass
+                        continue
+                    raise
+            else:
+                if last_e is not None:
+                    raise last_e
         except Exception as e:
             # If failure is due to unsupported attention backend, retry without it.
             s = str(e).lower()
@@ -1042,7 +1186,10 @@ def hf_generate(engine, model_name_or_path: str, prompt: str,
         raw = tokenizer(prompt, return_tensors="pt")
         target_dev = dev
         if used_device_map and not is_synthetic:
-            target_dev = _input_device_for_model(model, fallback=dev)
+            # With device_map/offload, inputs should generally be placed on the device where
+            # the input embeddings live (often CUDA). Avoid forcing CPU which can trigger
+            # warnings and may be slower.
+            target_dev = _input_device_for_model(model, fallback="cpu")
         if hasattr(raw, "to"):
             inputs = raw.to(target_dev)
         else:
@@ -1161,6 +1308,7 @@ def hf_generate(engine, model_name_or_path: str, prompt: str,
         return "".join(list(_iter_stream()))
 
     # Default transformers generation
+    do_sample = (temperature is not None) and (float(temperature) > 0.0)
     if stream:
         from transformers import TextIteratorStreamer
 
@@ -1188,21 +1336,23 @@ def hf_generate(engine, model_name_or_path: str, prompt: str,
 
         streamer = _CountingStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
         with torch.inference_mode():
-            _ = model.generate(
-                **inputs,
-                do_sample=True,
-                temperature=temperature,
-                max_new_tokens=max_new_tokens,
-                streamer=streamer,
-            )
+            gen_kwargs = {
+                "do_sample": bool(do_sample),
+                "max_new_tokens": int(max_new_tokens),
+                "streamer": streamer,
+            }
+            if do_sample:
+                gen_kwargs["temperature"] = float(temperature)
+            _ = model.generate(**inputs, **gen_kwargs)
         return streamer
     else:
         with torch.no_grad():
-            out = model.generate(
-                **inputs,
-                do_sample=True,
-                temperature=temperature,
-                max_new_tokens=max_new_tokens,
-            )
+            gen_kwargs = {
+                "do_sample": bool(do_sample),
+                "max_new_tokens": int(max_new_tokens),
+            }
+            if do_sample:
+                gen_kwargs["temperature"] = float(temperature)
+            out = model.generate(**inputs, **gen_kwargs)
         text = tokenizer.decode(out[0], skip_special_tokens=True)
         return text
